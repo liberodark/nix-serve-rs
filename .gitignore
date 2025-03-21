@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+.vscode/
+.idea/
+.fleet/
+*.iml
+.vim/
+.nvim/
+*.swp
+*.swo
