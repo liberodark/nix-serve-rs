@@ -32,23 +32,44 @@ impl SigningKey {
             .decode(key_base64.trim())
             .context("Failed to decode base64 signing key")?;
 
-        if key_bytes.len() != 64 {
+        if key_bytes.len() == 32 {
+            // For a 32-byte key, create a 64-byte array where:
+            // - First 32 bytes: the original key
+            // - Second 32 bytes: temporary placeholder (will be replaced by ed25519_dalek)
+
+            let mut keypair_bytes = [0u8; 64];
+
+            // Copy the 32-byte key into the first half of the array
+            keypair_bytes[..32].copy_from_slice(&key_bytes);
+
+            // Let ed25519_dalek handle the conversion
+            match Ed25519SigningKey::from_keypair_bytes(&keypair_bytes) {
+                Ok(key) => Ok(Self {
+                    name: name.to_string(),
+                    key,
+                }),
+                Err(e) => {
+                    anyhow::bail!("Failed to create signing key from 32-byte key: {}", e)
+                }
+            }
+        } else if key_bytes.len() == 64 {
+            // Original code for 64-byte keypairs
+            let mut keypair_bytes = [0u8; 64];
+            keypair_bytes.copy_from_slice(&key_bytes);
+
+            let key = Ed25519SigningKey::from_keypair_bytes(&keypair_bytes)
+                .context("Failed to create Ed25519 signing key")?;
+
+            Ok(Self {
+                name: name.to_string(),
+                key,
+            })
+        } else {
             anyhow::bail!(
-                "Invalid signing key length: expected 64 bytes, got {}",
+                "Invalid signing key length: expected 32 or 64 bytes, got {}",
                 key_bytes.len()
             );
         }
-
-        let mut keypair_bytes = [0u8; 64];
-        keypair_bytes.copy_from_slice(&key_bytes);
-
-        let key = Ed25519SigningKey::from_keypair_bytes(&keypair_bytes)
-            .context("Failed to create Ed25519 signing key")?;
-
-        Ok(Self {
-            name: name.to_string(),
-            key,
-        })
     }
 
     /// Sign a string with this key

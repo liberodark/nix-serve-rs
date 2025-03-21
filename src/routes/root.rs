@@ -46,7 +46,7 @@ pub async fn get(config: &Arc<Config>) -> Result<Response<BoxBody<Bytes, Infalli
         <div class="row">
             <div class="col text-center">
                 <small class="d-block mb-3 text-muted">
-                    Powered by <a href="https://github.com/yourusername/nix-serve-rs">nix-serve-rs</a>
+                    Powered by <a href="https://github.com/liberodark/nix-serve-rs">nix-serve-rs</a>
                 </small>
             </div>
         </div>
