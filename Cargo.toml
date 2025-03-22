@@ -39,7 +39,6 @@ tempfile = "3.8.1"
 mime = "0.3.17"
 mime_guess = "2.0.4"
 percent-encoding = "2.3.0"
-range-parser = "0.1.0"
 hex = "0.4.3"
 
 [dev-dependencies]

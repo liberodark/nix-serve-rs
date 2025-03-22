@@ -5,7 +5,7 @@ use http_body_util::combinators::BoxBody;
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::crypto::signing::{convert_base16_to_nix32, fingerprint_path};
@@ -135,10 +135,16 @@ async fn query_narinfo(
 /// NARInfo endpoint
 pub async fn get(
     hash: &str,
+    query: Option<&str>,
     config: &Arc<Config>,
     store: &Arc<NixStore>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("NAR info request for hash: {}", hash);
+
+    // Check if JSON output is requested
+    let json_output = query
+        .map(|q| q.contains("json=1") || q.contains("json=true"))
+        .unwrap_or(false);
 
     // Query path from hash part
     let store_path = match store.query_path_from_hash_part(hash).await? {
@@ -152,13 +158,105 @@ pub async fn get(
         None => return Ok(not_found()),
     };
 
-    // Format and return response
-    let body = format_narinfo_txt(&narinfo);
+    // Either format as JSON or text based on query parameter
+    if json_output {
+        // Convert to a structure that can be serialized to JSON
+        let json_output = serde_json::json!({
+            "storePath": narinfo.store_path,
+            "url": narinfo.url,
+            "compression": narinfo.compression,
+            "narHash": narinfo.nar_hash,
+            "narSize": narinfo.nar_size,
+            "references": narinfo.references,
+            "deriver": narinfo.deriver,
+            "signatures": narinfo.sigs,
+            "ca": narinfo.ca,
+        });
+
+        let json_str = serde_json::to_string_pretty(&json_output)?;
+
+        Ok(Response::builder()
+            .header("Content-Type", "application/json")
+            .header("Cache-Control", "max-age=86400") // 1 day
+            .body(full_body(&json_str))
+            .unwrap())
+    } else {
+        // Format and return response as text
+        let body = format_narinfo_txt(&narinfo);
+
+        Ok(Response::builder()
+            .header("Content-Type", "text/x-nix-narinfo")
+            .header("Nix-Link", &narinfo.url)
+            .header("Cache-Control", "max-age=86400") // 1 day
+            .body(full_body(&body))
+            .unwrap())
+    }
+}
+
+/// Handle PUT requests for narinfo files
+pub async fn put(
+    hash: &str,
+    body: bytes::Bytes,
+    config: &Arc<Config>,
+    _store: &Arc<NixStore>,
+) -> Result<Response<BoxBody<Bytes, Infallible>>> {
+    debug!("Processing narinfo upload for hash: {}", hash);
+
+    // First, verify the hash is valid
+    if hash.len() != 32 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .header("Content-Type", "text/plain")
+            .body(full_body("Invalid hash format"))
+            .unwrap());
+    }
+
+    // Parse the narinfo content
+    let content = std::str::from_utf8(&body)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Vérifier minimalement le contenu pour la journalisation
+    let mut found_store_path = false;
+    let mut found_nar_hash = false;
+    let mut found_nar_size = false;
+
+    for line in &lines {
+        if line.starts_with("StorePath: ") {
+            found_store_path = true;
+        } else if line.starts_with("NarHash: ") {
+            found_nar_hash = true;
+        } else if line.starts_with("NarSize: ") {
+            found_nar_size = true;
+        }
+    }
+
+    if !found_store_path || !found_nar_hash || !found_nar_size {
+        return Ok(Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .header("Content-Type", "text/plain")
+            .body(full_body("Missing required fields in narinfo"))
+            .unwrap());
+    }
+
+    // Ensure the narinfo directory exists
+    let real_store_str = config.real_store().to_string();
+    let parent_path = Path::new(&real_store_str)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine narinfo directory"))?;
+
+    if !parent_path.exists() {
+        tokio::fs::create_dir_all(parent_path).await?;
+    }
+
+    // Write the narinfo file
+    let narinfo_path = parent_path.join(format!("{}.narinfo", hash));
+    tokio::fs::write(&narinfo_path, content).await?;
+
+    info!("Successfully processed narinfo upload for {}", hash);
 
     Ok(Response::builder()
-        .header("Content-Type", "text/x-nix-narinfo")
-        .header("Nix-Link", &narinfo.url)
-        .header("Cache-Control", "max-age=86400") // 1 day
-        .body(full_body(&body))
+        .status(http::StatusCode::OK)
+        .header("Content-Type", "text/plain")
+        .body(full_body("OK"))
         .unwrap())
 }

@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::crypto::signing::SigningKey;
 
@@ -10,6 +11,7 @@ const DEFAULT_BIND: &str = "[::]:5000";
 const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_PRIORITY: usize = 30;
+const DEFAULT_STORE_DIR: &str = "/nix/store";
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,29 +20,50 @@ pub struct Config {
     #[serde(default = "default_bind")]
     pub bind: String,
 
+    /// Number of worker threads
     #[serde(default = "default_workers")]
     pub workers: usize,
 
+    /// Maximum number of connections
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
+    /// Priority for the binary cache
     #[serde(default = "default_priority")]
     pub priority: usize,
 
+    /// Path to the virtual Nix store (as advertised to clients)
     #[serde(default = "default_store_dir")]
     pub virtual_store: String,
 
+    /// Path to the real Nix store (where files are actually located)
     pub real_store: Option<String>,
 
+    /// Paths to signing keys
     #[serde(default)]
     pub sign_key_paths: Vec<String>,
 
+    /// Path to TLS certificate
     pub tls_cert_path: Option<String>,
 
+    /// Path to TLS key
     pub tls_key_path: Option<String>,
 
+    /// In-memory signing keys (parsed from sign_key_paths)
     #[serde(skip)]
     pub signing_keys: Vec<SigningKey>,
+
+    /// Whether to require authenticated uploads (clients must provide a valid signature)
+    #[serde(default = "default_false")]
+    pub require_auth_uploads: bool,
+
+    /// Whether to compress NARs when serving them (zstd compression)
+    #[serde(default = "default_false")]
+    pub compress_nars: bool,
+
+    /// zstd compression level (1-19, higher = better compression but slower)
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
 }
 
 fn default_bind() -> String {
@@ -60,7 +83,15 @@ fn default_priority() -> usize {
 }
 
 fn default_store_dir() -> String {
-    "/nix/store".to_string()
+    DEFAULT_STORE_DIR.to_string()
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_compression_level() -> i32 {
+    3
 }
 
 impl Default for Config {
@@ -76,14 +107,22 @@ impl Default for Config {
             tls_cert_path: None,
             tls_key_path: None,
             signing_keys: Vec::new(),
+            require_auth_uploads: false,
+            compress_nars: false,
+            compression_level: default_compression_level(),
         }
     }
 }
 
 impl Config {
     pub fn load(config_path: Option<&str>, args: &impl ArgsProvider) -> Result<Self> {
+        // Start with default configuration
         let mut config = Config::default();
 
+        // Try to load from environment variables first
+        Self::load_from_env(&mut config);
+
+        // Then load from config file if provided
         if let Some(path) = config_path {
             info!("Loading configuration from {}", path);
             let file_content = fs::read_to_string(path)
@@ -93,6 +132,7 @@ impl Config {
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
         }
 
+        // Override with command line arguments
         if let Some(bind) = args.bind() {
             config.bind = bind;
         }
@@ -105,10 +145,10 @@ impl Config {
             config.sign_key_paths.push(sign_key);
         }
 
-        if config.workers == 0 {
-            config.workers = 1;
-        }
+        // Validate configuration
+        Self::validate(&mut config)?;
 
+        // Load signing keys
         for key_path in &config.sign_key_paths {
             let signing_key = SigningKey::from_file(Path::new(key_path))
                 .with_context(|| format!("Failed to load signing key: {}", key_path))?;
@@ -117,6 +157,88 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    fn load_from_env(config: &mut Config) {
+        if let Ok(bind) = env::var("NIX_SERVE_BIND") {
+            config.bind = bind;
+        }
+
+        if let Ok(workers) = env::var("NIX_SERVE_WORKERS") {
+            if let Ok(workers) = workers.parse() {
+                config.workers = workers;
+            }
+        }
+
+        if let Ok(max_connections) = env::var("NIX_SERVE_MAX_CONNECTIONS") {
+            if let Ok(max_connections) = max_connections.parse() {
+                config.max_connections = max_connections;
+            }
+        }
+
+        if let Ok(priority) = env::var("NIX_SERVE_PRIORITY") {
+            if let Ok(priority) = priority.parse() {
+                config.priority = priority;
+            }
+        }
+
+        if let Ok(virtual_store) = env::var("NIX_SERVE_VIRTUAL_STORE") {
+            config.virtual_store = virtual_store;
+        }
+
+        if let Ok(real_store) = env::var("NIX_SERVE_REAL_STORE") {
+            config.real_store = Some(real_store);
+        }
+
+        if let Ok(sign_key_path) = env::var("NIX_SECRET_KEY_FILE") {
+            config.sign_key_paths.push(sign_key_path);
+        }
+
+        if let Ok(tls_cert) = env::var("NIX_SERVE_TLS_CERT") {
+            config.tls_cert_path = Some(tls_cert);
+        }
+
+        if let Ok(tls_key) = env::var("NIX_SERVE_TLS_KEY") {
+            config.tls_key_path = Some(tls_key);
+        }
+
+        if let Ok(require_auth) = env::var("NIX_SERVE_REQUIRE_AUTH") {
+            config.require_auth_uploads = require_auth.to_lowercase() == "true";
+        }
+
+        if let Ok(compress) = env::var("NIX_SERVE_COMPRESS") {
+            config.compress_nars = compress.to_lowercase() == "true";
+        }
+
+        if let Ok(level) = env::var("NIX_SERVE_COMPRESSION_LEVEL") {
+            if let Ok(level) = level.parse() {
+                config.compression_level = level;
+            }
+        }
+    }
+
+    fn validate(config: &mut Config) -> Result<()> {
+        // Enforce at least 1 worker
+        if config.workers == 0 {
+            warn!("workers must be greater than 0, setting to 1");
+            config.workers = 1;
+        }
+
+        // Check TLS configuration
+        if config.tls_cert_path.is_some() != config.tls_key_path.is_some() {
+            bail!("TLS configuration requires both cert and key files");
+        }
+
+        // Check zstd compression level
+        if config.compression_level < 1 || config.compression_level > 19 {
+            warn!(
+                "Invalid compression level {}, using default of 3",
+                config.compression_level
+            );
+            config.compression_level = 3;
+        }
+
+        Ok(())
     }
 
     pub fn real_store(&self) -> &str {

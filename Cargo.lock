@@ -1294,7 +1294,6 @@ dependencies = [
  "mime",
  "mime_guess",
  "percent-encoding",
- "range-parser",
  "serde",
  "serde_json",
  "sha2",
@@ -1544,15 +1543,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.15",
-]
-
-[[package]]
-name = "range-parser"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d26b5df187f049cc0264bed9ed314d5a5f7c13a2c3ec8b23b79723f938f39d71"
-dependencies = [
- "thiserror",
 ]
 
 [[package]]

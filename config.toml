@@ -1,0 +1,40 @@
+# nix-serve-rs configuration file
+
+# Address to bind to, can be an IP:port or unix:/path/to/socket
+bind = "[::]:5000"
+
+# Number of worker threads (recommended: number of CPU cores)
+workers = 4
+
+# Maximum number of concurrent connections
+max_connections = 1024
+
+# Priority of this binary cache (lower = higher priority)
+priority = 30
+
+# Virtual Nix store path (as seen by clients)
+virtual_store = "/nix/store"
+
+# Real Nix store path (optional, use if files are stored elsewhere)
+# real_store = "/mnt/nix/store"
+
+# Path(s) to the signing key(s)
+sign_key_paths = [
+    "/etc/nix/signing-key.sec"
+    # "/etc/nix/signing-key-2.sec"  # Multiple keys can be specified
+]
+
+# Whether to require authentication for uploads
+require_auth_uploads = false
+
+# Path to TLS certificate
+# tls_cert_path = "/etc/nix-serve-rs/cert.pem"
+
+# Path to TLS key
+# tls_key_path = "/etc/nix-serve-rs/key.pem"
+
+# Whether to compress NARs when serving them
+compress_nars = false
+
+# zstd compression level (1-19, higher = better compression but slower)
+compression_level = 3

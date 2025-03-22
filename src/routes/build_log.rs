@@ -22,7 +22,6 @@ fn get_build_log_path(store_path: &Path, drv_path: &Path) -> Option<PathBuf> {
     let drv_name = drv_name.to_str()?;
 
     // Build logs are stored in /nix/var/log/nix/drvs/{first2}/{rest}
-    // where {first2} are the first 2 characters of the hash
     if drv_name.len() < 2 {
         return None;
     }
@@ -49,6 +48,14 @@ fn get_build_log_path(store_path: &Path, drv_path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Determine if a log file is compressed
+fn is_compressed_log(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext == "bz2")
+        .unwrap_or(false)
 }
 
 pub async fn get(
@@ -81,33 +88,70 @@ pub async fn get(
         }
     };
 
-    match File::open(&log_path).await {
-        Ok(file) => {
-            let stream = ReaderStream::new(file);
+    // Check if the log is compressed
+    let is_compressed = is_compressed_log(&log_path);
 
-            // Transform the stream to ensure it can be used with BoxBody
-            // Convert Bytes to Frame<Bytes> as required by hyper 1.0
-            let mapped_stream = stream.map(|result| {
-                match result {
+    if is_compressed {
+        debug!("Decompressing build log: {}", log_path.display());
+
+        // For bz2 files, use an external process for decompression
+        let mut cmd = tokio::process::Command::new("bzip2")
+            .arg("-d")
+            .arg("-c")
+            .arg(&log_path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+
+        let stdout = cmd
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to get stdout of bzip2 process"))?;
+
+        // Create a stream from the decompressed output
+        let decompressed_stream = ReaderStream::new(stdout);
+
+        // Transform the stream for hyper 1.0 compatibility
+        let mapped_stream = decompressed_stream.map(|result| match result {
+            Ok(chunk) => Ok(Frame::data(chunk)),
+            Err(e) => {
+                error!("Error reading decompressed build log: {}", e);
+                Ok(Frame::data(Bytes::new()))
+            }
+        });
+
+        let body = BoxBody::new(StreamBody::new(mapped_stream));
+
+        Ok(Response::builder()
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Cache-Control", "max-age=31536000") // 1 year
+            .body(body)
+            .unwrap())
+    } else {
+        match File::open(&log_path).await {
+            Ok(file) => {
+                let stream = ReaderStream::new(file);
+
+                // Transform the stream for hyper 1.0 compatibility
+                let mapped_stream = stream.map(|result| match result {
                     Ok(chunk) => Ok(Frame::data(chunk)),
                     Err(e) => {
                         error!("Error reading build log: {}", e);
-                        Ok(Frame::data(Bytes::new())) // Return empty frame on error
+                        Ok(Frame::data(Bytes::new()))
                     }
-                }
-            });
+                });
 
-            let body = BoxBody::new(StreamBody::new(mapped_stream));
+                let body = BoxBody::new(StreamBody::new(mapped_stream));
 
-            Ok(Response::builder()
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .header("Cache-Control", "max-age=31536000") // 1 year
-                .body(body)
-                .unwrap())
-        }
-        Err(e) => {
-            error!("Failed to open build log {}: {}", log_path.display(), e);
-            Ok(not_found())
+                Ok(Response::builder()
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .header("Cache-Control", "max-age=31536000") // 1 year
+                    .body(body)
+                    .unwrap())
+            }
+            Err(e) => {
+                error!("Failed to open build log {}: {}", log_path.display(), e);
+                Ok(not_found())
+            }
         }
     }
 }
