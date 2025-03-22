@@ -2,18 +2,46 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use crate::crypto::signing::SigningKey;
+use crate::signing::SigningKey;
+use crate::store::Store;
 
-const DEFAULT_BIND: &str = "[::]:5000";
-const DEFAULT_WORKERS: usize = 4;
-const DEFAULT_MAX_CONNECTIONS: usize = 1024;
-const DEFAULT_PRIORITY: usize = 30;
-const DEFAULT_STORE_DIR: &str = "/nix/store";
+// Default values for serde
+fn default_bind() -> String {
+    "[::]:5000".into()
+}
 
-/// Server configuration
+fn default_workers() -> usize {
+    4
+}
+
+fn default_max_connections() -> usize {
+    1024
+}
+
+fn default_priority() -> usize {
+    30
+}
+
+fn default_store_dir() -> String {
+    "/nix/store".into()
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_compression_level() -> i32 {
+    3
+}
+
+fn default_compression_format() -> String {
+    "xz".to_string()
+}
+
+/// Main server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Bind address (format: [host]:port or unix:/path/to/socket)
@@ -28,20 +56,20 @@ pub struct Config {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
-    /// Priority for the binary cache
+    /// Binary cache priority
     #[serde(default = "default_priority")]
     pub priority: usize,
 
-    /// Path to the virtual Nix store (as advertised to clients)
+    /// Virtual Nix store path (as advertised to clients)
     #[serde(default = "default_store_dir")]
     pub virtual_store: String,
 
-    /// Path to the real Nix store (where files are actually located)
+    /// Real Nix store path (where files are actually located)
     pub real_store: Option<String>,
 
     /// Paths to signing keys
     #[serde(default)]
-    pub sign_key_paths: Vec<String>,
+    pub sign_key_paths: Vec<PathBuf>,
 
     /// Path to TLS certificate
     pub tls_cert_path: Option<String>,
@@ -53,11 +81,11 @@ pub struct Config {
     #[serde(skip)]
     pub signing_keys: Vec<SigningKey>,
 
-    /// Whether to require authenticated uploads (clients must provide a valid signature)
+    /// Whether to require authenticated uploads
     #[serde(default = "default_false")]
     pub require_auth_uploads: bool,
 
-    /// Whether to compress NARs when serving them (zstd or xz compression)
+    /// Whether to compress NARs when serving them
     #[serde(default = "default_false")]
     pub compress_nars: bool,
 
@@ -68,38 +96,10 @@ pub struct Config {
     /// Compression format to use (zstd or xz)
     #[serde(default = "default_compression_format")]
     pub compression_format: String,
-}
 
-fn default_bind() -> String {
-    DEFAULT_BIND.to_string()
-}
-
-fn default_workers() -> usize {
-    DEFAULT_WORKERS
-}
-
-fn default_max_connections() -> usize {
-    DEFAULT_MAX_CONNECTIONS
-}
-
-fn default_priority() -> usize {
-    DEFAULT_PRIORITY
-}
-
-fn default_store_dir() -> String {
-    DEFAULT_STORE_DIR.to_string()
-}
-
-fn default_false() -> bool {
-    false
-}
-
-fn default_compression_level() -> i32 {
-    3
-}
-
-fn default_compression_format() -> String {
-    "xz".to_string()
+    /// Configured store instance
+    #[serde(skip)]
+    pub store: Store,
 }
 
 impl Default for Config {
@@ -119,60 +119,59 @@ impl Default for Config {
             compress_nars: false,
             compression_level: default_compression_level(),
             compression_format: default_compression_format(),
+            store: Store::new(default_store_dir(), None),
         }
     }
 }
 
 impl Config {
-    pub fn load(config_path: Option<&str>, args: &impl ArgsProvider) -> Result<Self> {
+    /// Load configuration from a file
+    pub fn load(settings_file: &Path) -> Result<Self> {
+        toml::from_str(
+            &fs::read_to_string(settings_file).with_context(|| {
+                format!("Failed to read config file: {}", settings_file.display())
+            })?,
+        )
+        .with_context(|| format!("Failed to parse config file: {}", settings_file.display()))
+    }
+
+    /// Load configuration from environment and files
+    pub fn load_from_env() -> Result<Self> {
         // Start with default configuration
-        let mut config = Config::default();
+        let mut config = match std::env::var("CONFIG_FILE") {
+            Ok(path) => Self::load(Path::new(&path))?,
+            Err(_) => {
+                if Path::new("settings.toml").exists() {
+                    Self::load(Path::new("settings.toml"))?
+                } else {
+                    Config::default()
+                }
+            }
+        };
 
-        // Try to load from environment variables first
-        Self::load_from_env(&mut config);
-
-        // Then load from config file if provided
-        if let Some(path) = config_path {
-            info!("Loading configuration from {}", path);
-            let file_content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {}", path))?;
-
-            config = toml::from_str(&file_content)
-                .with_context(|| format!("Failed to parse config file: {}", path))?;
+        // Check workers
+        if config.workers == 0 {
+            warn!("workers must be greater than 0, setting to 1");
+            config.workers = 1;
         }
 
-        // Override with command line arguments
-        if let Some(bind) = args.bind() {
-            config.bind = bind;
-        }
+        // Load from environment variables
+        Self::load_from_env_vars(&mut config);
 
-        if let Some(workers) = args.workers() {
-            config.workers = workers;
-        }
+        // Load signing keys
+        Self::load_signing_keys(&mut config)?;
 
-        if let Some(sign_key) = args.sign_key() {
-            config.sign_key_paths.push(sign_key);
-        }
-
-        if let Some(compress) = args.compress_nars() {
-            config.compress_nars = compress;
-        }
+        // Configure the store
+        config.store = Store::new(config.virtual_store.clone(), config.real_store.clone());
 
         // Validate configuration
         Self::validate(&mut config)?;
 
-        // Load signing keys
-        for key_path in &config.sign_key_paths {
-            let signing_key = SigningKey::from_file(Path::new(key_path))
-                .with_context(|| format!("Failed to load signing key: {}", key_path))?;
-
-            config.signing_keys.push(signing_key);
-        }
-
         Ok(config)
     }
 
-    fn load_from_env(config: &mut Config) {
+    /// Load values from environment variables
+    fn load_from_env_vars(config: &mut Self) {
         if let Ok(bind) = env::var("NIX_SERVE_BIND") {
             config.bind = bind;
         }
@@ -204,7 +203,13 @@ impl Config {
         }
 
         if let Ok(sign_key_path) = env::var("NIX_SECRET_KEY_FILE") {
-            config.sign_key_paths.push(sign_key_path);
+            config.sign_key_paths.push(PathBuf::from(sign_key_path));
+        }
+
+        if let Ok(sign_key_paths) = env::var("NIX_SECRET_KEY_FILES") {
+            for path in sign_key_paths.split_whitespace() {
+                config.sign_key_paths.push(PathBuf::from(path));
+            }
         }
 
         if let Ok(tls_cert) = env::var("NIX_SERVE_TLS_CERT") {
@@ -234,19 +239,28 @@ impl Config {
         }
     }
 
-    fn validate(config: &mut Config) -> Result<()> {
-        // Enforce at least 1 worker
-        if config.workers == 0 {
-            warn!("workers must be greater than 0, setting to 1");
-            config.workers = 1;
+    /// Load signing keys from configured paths
+    fn load_signing_keys(config: &mut Self) -> Result<()> {
+        for sign_key_path in &config.sign_key_paths {
+            let signing_key =
+                crate::signing::parse_secret_key(sign_key_path).with_context(|| {
+                    format!("Failed to load signing key: {}", sign_key_path.display())
+                })?;
+
+            config.signing_keys.push(signing_key);
         }
 
-        // Check TLS configuration
+        Ok(())
+    }
+
+    /// Validate configuration and adjust values if necessary
+    fn validate(config: &mut Self) -> Result<()> {
+        // Validate TLS configuration
         if config.tls_cert_path.is_some() != config.tls_key_path.is_some() {
             bail!("TLS configuration requires both cert and key files");
         }
 
-        // Check compression format
+        // Validate compression format
         if !["xz", "zstd"].contains(&config.compression_format.as_str()) {
             warn!(
                 "Invalid compression format {}, using default of 'xz'",
@@ -255,7 +269,7 @@ impl Config {
             config.compression_format = "xz".to_string();
         }
 
-        // Check compression level
+        // Validate compression level
         match config.compression_format.as_str() {
             "xz" => {
                 if config.compression_level < 0 || config.compression_level > 9 {
@@ -276,7 +290,7 @@ impl Config {
                 }
             }
             _ => {
-                // We already validated format above, this should never happen
+                // Should never happen due to previous validation
                 config.compression_format = "xz".to_string();
                 config.compression_level = 3;
             }
@@ -285,14 +299,102 @@ impl Config {
         Ok(())
     }
 
+    /// Get the real store path
     pub fn real_store(&self) -> &str {
         self.real_store.as_deref().unwrap_or(&self.virtual_store)
     }
 }
 
+/// Trait for argument providers (CLI, etc.)
 pub trait ArgsProvider {
     fn bind(&self) -> Option<String>;
     fn workers(&self) -> Option<usize>;
     fn sign_key(&self) -> Option<String>;
     fn compress_nars(&self) -> Option<bool>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert_eq!(config.bind, "[::]:5000");
+        assert_eq!(config.workers, 4);
+        assert_eq!(config.priority, 30);
+        assert_eq!(config.virtual_store, "/nix/store");
+        assert!(config.real_store.is_none());
+        assert!(!config.compress_nars);
+        assert_eq!(config.compression_format, "xz");
+        assert_eq!(config.compression_level, 3);
+    }
+
+    #[test]
+    fn test_load_from_toml() -> Result<()> {
+        let dir = tempdir()?;
+        let config_path = dir.path().join("config.toml");
+
+        let config_content = r#"
+        bind = "127.0.0.1:8080"
+        workers = 8
+        priority = 20
+        virtual_store = "/custom/store"
+        real_store = "/actual/store"
+        compress_nars = true
+        compression_level = 5
+        compression_format = "zstd"
+        "#;
+
+        let mut file = std::fs::File::create(&config_path)?;
+        write!(file, "{}", config_content)?;
+
+        let config = Config::load(&config_path)?;
+
+        assert_eq!(config.bind, "127.0.0.1:8080");
+        assert_eq!(config.workers, 8);
+        assert_eq!(config.priority, 20);
+        assert_eq!(config.virtual_store, "/custom/store");
+        assert_eq!(config.real_store, Some("/actual/store".to_string()));
+        assert!(config.compress_nars);
+        assert_eq!(config.compression_level, 5);
+        assert_eq!(config.compression_format, "zstd");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_validation() -> Result<()> {
+        // Test compression format validation
+        let mut config = Config::default();
+        config.compression_format = "invalid".to_string();
+        Config::validate(&mut config)?;
+        assert_eq!(config.compression_format, "xz");
+
+        // Test xz compression level validation
+        config.compression_format = "xz".to_string();
+        config.compression_level = 15;
+        Config::validate(&mut config)?;
+        assert_eq!(config.compression_level, 3);
+
+        // Test zstd compression level validation
+        config.compression_format = "zstd".to_string();
+        config.compression_level = 0;
+        Config::validate(&mut config)?;
+        assert_eq!(config.compression_level, 3);
+
+        // Test TLS validation - cert without key
+        config.tls_cert_path = Some("cert.pem".to_string());
+        config.tls_key_path = None;
+        assert!(Config::validate(&mut config).is_err());
+
+        // Valid TLS config
+        config.tls_cert_path = Some("cert.pem".to_string());
+        config.tls_key_path = Some("key.pem".to_string());
+        assert!(Config::validate(&mut config).is_ok());
+
+        Ok(())
+    }
 }
