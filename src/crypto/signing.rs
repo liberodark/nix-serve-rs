@@ -32,23 +32,33 @@ impl SigningKey {
             .decode(key_base64.trim())
             .context("Failed to decode base64 signing key")?;
 
-        if key_bytes.len() != 64 {
-            anyhow::bail!(
-                "Invalid signing key length: expected 64 bytes, got {}",
-                key_bytes.len()
-            );
+        if key_bytes.len() == 32 {
+            let mut secret_bytes = [0u8; 32];
+            secret_bytes.copy_from_slice(&key_bytes);
+
+            let key = Ed25519SigningKey::from_bytes(&secret_bytes);
+
+            return Ok(Self {
+                name: name.to_string(),
+                key,
+            });
+        } else if key_bytes.len() == 64 {
+            let mut keypair_bytes = [0u8; 64];
+            keypair_bytes.copy_from_slice(&key_bytes);
+
+            let key = Ed25519SigningKey::from_keypair_bytes(&keypair_bytes)
+                .context("Failed to create Ed25519 signing key")?;
+
+            return Ok(Self {
+                name: name.to_string(),
+                key,
+            });
         }
 
-        let mut keypair_bytes = [0u8; 64];
-        keypair_bytes.copy_from_slice(&key_bytes);
-
-        let key = Ed25519SigningKey::from_keypair_bytes(&keypair_bytes)
-            .context("Failed to create Ed25519 signing key")?;
-
-        Ok(Self {
-            name: name.to_string(),
-            key,
-        })
+        anyhow::bail!(
+            "Invalid signing key length: expected 32 or 64 bytes, got {}",
+            key_bytes.len()
+        )
     }
 
     /// Sign a string with this key
