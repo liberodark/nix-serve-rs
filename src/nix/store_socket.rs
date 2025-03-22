@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::config::Config;
+use crate::crypto::signing::convert_base16_to_nix32;
 use crate::error::{NixServeError, NixServeResult};
 use crate::nix::daemon_protocol::{NixDaemonProtocol, PathInfo as DaemonPathInfo};
 use crate::nix::path_info::PathInfo;
@@ -277,7 +278,27 @@ impl NixStore {
             return Ok(None);
         }
 
-        let hash = String::from_utf8(hash_output.stdout)?.trim().to_string();
+        let raw_hash = String::from_utf8(hash_output.stdout)?.trim().to_string();
+
+        // Convert the hash to base32 if it's in hex format and add sha256: prefix
+        let hash = if raw_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Try to convert from hex to base32
+            match convert_base16_to_nix32(&raw_hash) {
+                Ok(base32) => format!("sha256:{}", base32),
+                Err(e) => {
+                    debug!("Failed to convert hash to base32: {}", e);
+                    if raw_hash.starts_with("sha256:") {
+                        raw_hash
+                    } else {
+                        format!("sha256:{}", raw_hash)
+                    }
+                }
+            }
+        } else if raw_hash.starts_with("sha256:") {
+            raw_hash
+        } else {
+            format!("sha256:{}", raw_hash)
+        };
 
         // Get NAR size
         let size_output = tokio::process::Command::new("nix-store")
@@ -481,101 +502,47 @@ impl NixStore {
                 NixServeError::internal(format!("Invalid store path format: {}", store_path))
             })?;
 
-        // Get path info
-        let path_info = match self.query_path_info(store_path).await? {
-            Some(info) => info,
-            None => {
-                // If path info is not available, we need to regenerate it
-                // This is a valid case when we've just imported a NAR
-                debug!("Path info not found for {}, regenerating", store_path);
-
-                // Run nix-store --query to get the info
-                let hash_output = tokio::process::Command::new("nix-store")
-                    .arg("--query")
-                    .arg("--hash")
-                    .arg(store_path)
-                    .output()
-                    .await
-                    .map_err(|e| {
-                        NixServeError::nix_daemon(format!("Failed to query hash: {}", e))
-                    })?;
-
-                if !hash_output.status.success() {
-                    return Err(NixServeError::nix_daemon(
-                        "Failed to query hash information".to_string(),
-                    ));
-                }
-
-                let hash = String::from_utf8(hash_output.stdout)
-                    .map_err(|e| {
-                        NixServeError::internal(format!("Invalid UTF-8 in hash output: {}", e))
-                    })?
-                    .trim()
-                    .to_string();
-
-                // Get NAR size
-                let size_output = tokio::process::Command::new("nix-store")
-                    .arg("--query")
-                    .arg("--size")
-                    .arg(store_path)
-                    .output()
-                    .await
-                    .map_err(|e| {
-                        NixServeError::nix_daemon(format!("Failed to query size: {}", e))
-                    })?;
-
-                if !size_output.status.success() {
-                    return Err(NixServeError::nix_daemon(
-                        "Failed to query size information".to_string(),
-                    ));
-                }
-
-                let nar_size = String::from_utf8(size_output.stdout)
-                    .map_err(|e| {
-                        NixServeError::internal(format!("Invalid UTF-8 in size output: {}", e))
-                    })?
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|e| NixServeError::internal(format!("Failed to parse size: {}", e)))?;
-
-                // Get references
-                let refs_output = tokio::process::Command::new("nix-store")
-                    .arg("--query")
-                    .arg("--references")
-                    .arg(store_path)
-                    .output()
-                    .await
-                    .map_err(|e| {
-                        NixServeError::nix_daemon(format!("Failed to query references: {}", e))
-                    })?;
-
-                if !refs_output.status.success() {
-                    return Err(NixServeError::nix_daemon(
-                        "Failed to query references information".to_string(),
-                    ));
-                }
-
-                let references = String::from_utf8(refs_output.stdout)
-                    .map_err(|e| {
-                        NixServeError::internal(format!("Invalid UTF-8 in refs output: {}", e))
-                    })?
-                    .lines()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
-
-                // Construct a basic PathInfo
-                PathInfo {
-                    deriver: None,
-                    hash,
-                    references,
-                    registration_time: 0,
-                    nar_size,
-                    ultimate: false,
-                    sigs: Vec::new(),
-                    content_address: None,
-                }
+        // Query path info using the daemon socket
+        let path_info = match self.daemon.lock().await.query_path_info(store_path).await {
+            Ok(daemon_info) => {
+                // Convert from daemon's PathInfo to our PathInfo
+                convert_path_info(daemon_info)
+            }
+            Err(e) => {
+                debug!("Failed to query path info via daemon: {}", e);
+                return Err(NixServeError::nix_daemon(format!(
+                    "Failed to query path info: {}",
+                    e
+                )));
             }
         };
+
+        // Log the raw hash from the daemon
+        debug!("Raw hash from daemon: {}", path_info.hash);
+
+        // Convert the hash exactly as Harmonia does
+        // First, strip any "sha256:" prefix if present
+        let hash_hex = if path_info.hash.starts_with("sha256:") {
+            path_info.hash[7..].to_string()
+        } else {
+            path_info.hash.clone()
+        };
+
+        // Convert from base16 to base32
+        let hash_base32 = match convert_base16_to_nix32(&hash_hex) {
+            Ok(base32) => base32,
+            Err(e) => {
+                debug!("Failed to convert hash to base32: {}", e);
+                return Err(NixServeError::internal(format!(
+                    "Failed to convert hash to base32: {}",
+                    e
+                )));
+            }
+        };
+
+        // Format with sha256: prefix
+        let nar_hash = format!("sha256:{}", hash_base32);
+        debug!("Formatted NAR hash: {}", nar_hash);
 
         // Determine the directory to store narinfo files
         let store_root = Path::new(&self.real_store);
@@ -604,6 +571,18 @@ impl NixStore {
             format!("nar/{}.nar", hash_part)
         };
 
+        // Get reference basenames
+        let ref_basenames = path_info
+            .references
+            .iter()
+            .filter_map(|r| {
+                Path::new(r)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
         // Create narinfo content
         let narinfo_content =
             format!(
@@ -611,10 +590,13 @@ impl NixStore {
             store_path,
             url,
             if self.config.compress_nars { &self.config.compression_format } else { "none" },
-            path_info.hash,
+            nar_hash,
             path_info.nar_size,
-            path_info.reference_basenames().join(" ")
+            ref_basenames
         );
+
+        // Log the narinfo content for debugging
+        debug!("Generated narinfo content:\n{}", narinfo_content);
 
         // Write narinfo file
         let narinfo_path = narinfo_dir.join(format!("{}.narinfo", hash_part));
