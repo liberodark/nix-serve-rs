@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::config::Config;
 use crate::error::{NixServeError, NixServeResult};
 use crate::nix::daemon_protocol::{NixDaemonProtocol, PathInfo as DaemonPathInfo};
 use crate::nix::path_info::PathInfo;
@@ -47,6 +48,7 @@ pub struct NixStore {
     real_store: String,
     daemon: Mutex<NixDaemonProtocol>,
     cache: Mutex<PathInfoCache>,
+    config: Config,
 }
 
 // Helper function to convert between PathInfo types
@@ -70,14 +72,24 @@ impl NixStore {
             info!("Using real Nix store: {}", real);
         }
 
+        // Initialize the daemon connection
         let daemon = NixDaemonProtocol::new();
+
+        // Create a default config (will be updated later)
+        let config = Config::default();
 
         Ok(Self {
             virtual_store: virtual_store.to_string(),
             real_store: real_store.unwrap_or(virtual_store).to_string(),
             daemon: Mutex::new(daemon),
             cache: Mutex::new(PathInfoCache::new(1000)),
+            config,
         })
+    }
+
+    // Set the config (call this after initialization)
+    pub fn set_config(&mut self, config: Config) {
+        self.config = config;
     }
 
     pub fn virtual_store(&self) -> &str {
@@ -108,13 +120,25 @@ impl NixStore {
             }
         }
 
-        // Use the protocol directly
+        // Query via daemon protocol
         match self.daemon.lock().await.is_valid_path(path).await {
             Ok(valid) => Ok(valid),
-            Err(e) => Err(NixServeError::nix_daemon(format!(
-                "Failed to check path validity: {}",
-                e
-            ))),
+            Err(e) => {
+                debug!("Daemon protocol failed for is_valid_path: {}", e);
+
+                // Fallback to command line
+                let output = tokio::process::Command::new("nix-store")
+                    .arg("--query")
+                    .arg("--valid")
+                    .arg(path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to execute nix-store: {}", e))
+                    })?;
+
+                Ok(output.status.success())
+            }
         }
     }
 
@@ -135,7 +159,7 @@ impl NixStore {
             }
         }
 
-        // Query from daemon directly
+        // Not in cache, query from daemon directly
         match self
             .daemon
             .lock()
@@ -145,53 +169,40 @@ impl NixStore {
         {
             Ok(result) => Ok(result),
             Err(e) => {
-                // Try fallback command-line method if daemon fails
-                debug!("Daemon protocol failed, using fallback command: {}", e);
-                self.query_path_from_hash_part_fallback(hash_part).await
+                debug!("Daemon protocol failed: {}", e);
+
+                // If direct daemon call fails, try fallback method
+                let output = tokio::process::Command::new("nix-store")
+                    .arg("--query")
+                    .arg("--outputs")
+                    .arg(format!("/nix/store/{}-*", hash_part))
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to execute nix-store: {}", e))
+                    })?;
+
+                if output.status.success() {
+                    let path = String::from_utf8(output.stdout)
+                        .map_err(|e| {
+                            NixServeError::nix_daemon(format!("Invalid UTF-8 in output: {}", e))
+                        })?
+                        .trim()
+                        .to_string();
+
+                    if path.is_empty() {
+                        debug!("No path found for hash part: {}", hash_part);
+                        Ok(None)
+                    } else {
+                        debug!("Found path for hash part {}: {}", hash_part, path);
+                        Ok(Some(path))
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    debug!("nix-store command failed: {}", stderr);
+                    Ok(None)
+                }
             }
-        }
-    }
-
-    // Fallback method using command-line tools
-    async fn query_path_from_hash_part_fallback(
-        &self,
-        hash_part: &str,
-    ) -> NixServeResult<Option<String>> {
-        debug!(
-            "Using fallback command-line method for hash part: {}",
-            hash_part
-        );
-
-        let output = tokio::process::Command::new("nix-store")
-            .arg("--query")
-            .arg("--outputs")
-            .arg(format!("/nix/store/{}-*", hash_part))
-            .output()
-            .await
-            .map_err(|e| {
-                NixServeError::nix_daemon(format!("Failed to execute nix-store: {}", e))
-            })?;
-
-        if output.status.success() {
-            let path = String::from_utf8(output.stdout)
-                .map_err(|e| NixServeError::nix_daemon(format!("Invalid UTF-8 in output: {}", e)))?
-                .trim()
-                .to_string();
-
-            if path.is_empty() {
-                debug!("No path found for hash part (fallback): {}", hash_part);
-                Ok(None)
-            } else {
-                debug!(
-                    "Found path for hash part {} (fallback): {}",
-                    hash_part, path
-                );
-                Ok(Some(path))
-            }
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            debug!("nix-store command failed: {}", stderr);
-            Ok(None)
         }
     }
 
@@ -205,28 +216,137 @@ impl NixStore {
         }
 
         // Not in cache, query from daemon
-        match self.daemon.lock().await.query_path_info(path).await {
+        let result = match self.daemon.lock().await.query_path_info(path).await {
             Ok(daemon_info) => {
-                // Convert from daemon's PathInfo to our PathInfo
-                let path_info = convert_path_info(daemon_info);
+                // Convert daemon PathInfo to our PathInfo
+                let info = convert_path_info(daemon_info);
 
-                // Update cache
-                let mut cache = self.cache.lock().await;
-                cache.insert(path.to_string(), path_info.clone());
+                // Cache the result
+                {
+                    let mut cache = self.cache.lock().await;
+                    cache.insert(path.to_string(), info.clone());
+                }
 
-                Ok(Some(path_info))
+                Some(info)
             }
             Err(e) => {
-                if e.to_string().contains("Path not found") {
-                    Ok(None) // Path not found
-                } else {
-                    Err(NixServeError::nix_daemon(format!(
-                        "Failed to query path info: {}",
-                        e
-                    )))
+                debug!("Failed to query path info via daemon: {}", e);
+
+                // If direct daemon call fails, check if path is valid first
+                if !self.is_valid_path(path).await? {
+                    debug!("Path is not valid: {}", path);
+                    return Ok(None);
+                }
+
+                // Fallback to command-line approach
+                match self.query_path_info_fallback(path).await {
+                    Ok(Some(info)) => {
+                        // Cache the result
+                        {
+                            let mut cache = self.cache.lock().await;
+                            cache.insert(path.to_string(), info.clone());
+                        }
+                        Some(info)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        debug!("Failed to query path info via fallback: {}", e);
+                        None
+                    }
                 }
             }
+        };
+
+        Ok(result)
+    }
+
+    // Fallback method to get path info using command line
+    async fn query_path_info_fallback(&self, path: &str) -> Result<Option<PathInfo>> {
+        debug!("Using fallback to query path info: {}", path);
+
+        // Get hash
+        let hash_output = tokio::process::Command::new("nix-store")
+            .arg("--query")
+            .arg("--hash")
+            .arg(path)
+            .output()
+            .await?;
+
+        if !hash_output.status.success() {
+            debug!("Failed to get hash for path: {}", path);
+            return Ok(None);
         }
+
+        let hash = String::from_utf8(hash_output.stdout)?.trim().to_string();
+
+        // Get NAR size
+        let size_output = tokio::process::Command::new("nix-store")
+            .arg("--query")
+            .arg("--size")
+            .arg(path)
+            .output()
+            .await?;
+
+        if !size_output.status.success() {
+            debug!("Failed to get size for path: {}", path);
+            return Ok(None);
+        }
+
+        let nar_size = String::from_utf8(size_output.stdout)?
+            .trim()
+            .parse::<u64>()?;
+
+        // Get references
+        let refs_output = tokio::process::Command::new("nix-store")
+            .arg("--query")
+            .arg("--references")
+            .arg(path)
+            .output()
+            .await?;
+
+        if !refs_output.status.success() {
+            debug!("Failed to get references for path: {}", path);
+            return Ok(None);
+        }
+
+        let references = String::from_utf8(refs_output.stdout)?
+            .lines()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+
+        // Get deriver
+        let deriver_output = tokio::process::Command::new("nix-store")
+            .arg("--query")
+            .arg("--deriver")
+            .arg(path)
+            .output()
+            .await?;
+
+        let deriver = if deriver_output.status.success() {
+            let deriver = String::from_utf8(deriver_output.stdout)?.trim().to_string();
+
+            if deriver == "unknown-deriver" || deriver.is_empty() {
+                None
+            } else {
+                Some(deriver)
+            }
+        } else {
+            None
+        };
+
+        // Construct a PathInfo object
+        let info = PathInfo {
+            deriver,
+            hash,
+            references,
+            registration_time: 0, // Not easily available from command line
+            nar_size,
+            ultimate: false,       // Not easily available from command line
+            sigs: Vec::new(),      // Not easily available from command line
+            content_address: None, // Not easily available from command line
+        };
+
+        Ok(Some(info))
     }
 
     // Store a NAR file in the cache
@@ -262,6 +382,13 @@ impl NixStore {
 
         let nar_path = nar_dir.join(&filename);
 
+        // Ensure parent directories exist
+        if let Some(parent) = nar_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                NixServeError::internal(format!("Failed to create parent directory: {}", e))
+            })?;
+        }
+
         // Write the NAR data to the file
         let mut file = File::create(&nar_path)
             .await
@@ -280,21 +407,60 @@ impl NixStore {
     pub async fn import_nar(&self, nar_path: &Path) -> NixServeResult<String> {
         debug!("Importing NAR file: {}", nar_path.display());
 
-        // Read the NAR file
+        // Read the NAR data
         let nar_data = tokio::fs::read(nar_path)
             .await
             .map_err(|e| NixServeError::nix_daemon(format!("Failed to read NAR file: {}", e)))?;
 
-        // Import the NAR using the daemon protocol
-        match self.daemon.lock().await.import_nar(&nar_data).await {
+        // Create a basename from the path
+        let basename = nar_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "imported.nar".to_string());
+
+        // Try to import using the daemon protocol directly
+        match self
+            .daemon
+            .lock()
+            .await
+            .add_to_store_nar(&nar_data, &basename)
+            .await
+        {
             Ok(store_path) => {
                 info!("Imported NAR to store path: {}", store_path);
                 Ok(store_path)
             }
-            Err(e) => Err(NixServeError::nix_daemon(format!(
-                "Failed to import NAR: {}",
-                e
-            ))),
+            Err(e) => {
+                debug!("Failed to import NAR using daemon protocol: {}", e);
+
+                // Fallback to command-line approach if daemon protocol fails
+                let output = tokio::process::Command::new("nix-store")
+                    .arg("--import")
+                    .arg(nar_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to execute nix-store: {}", e))
+                    })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(NixServeError::nix_daemon(format!(
+                        "Failed to import NAR using nix-store command: {}",
+                        stderr
+                    )));
+                }
+
+                let store_path = String::from_utf8(output.stdout)
+                    .map_err(|e| {
+                        NixServeError::internal(format!("Invalid UTF-8 in nix-store output: {}", e))
+                    })?
+                    .trim()
+                    .to_string();
+
+                info!("Imported NAR to store path (fallback): {}", store_path);
+                Ok(store_path)
+            }
         }
     }
 
@@ -306,12 +472,6 @@ impl NixStore {
     ) -> NixServeResult<()> {
         debug!("Adding {} to binary cache", store_path);
 
-        // Get path info
-        let path_info = self
-            .query_path_info(store_path)
-            .await?
-            .ok_or_else(|| NixServeError::path_not_found(store_path.to_string()))?;
-
         // Extract hash part from store path
         let hash_part = store_path
             .split('/')
@@ -321,8 +481,103 @@ impl NixStore {
                 NixServeError::internal(format!("Invalid store path format: {}", store_path))
             })?;
 
+        // Get path info
+        let path_info = match self.query_path_info(store_path).await? {
+            Some(info) => info,
+            None => {
+                // If path info is not available, we need to regenerate it
+                // This is a valid case when we've just imported a NAR
+                debug!("Path info not found for {}, regenerating", store_path);
+
+                // Run nix-store --query to get the info
+                let hash_output = tokio::process::Command::new("nix-store")
+                    .arg("--query")
+                    .arg("--hash")
+                    .arg(store_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to query hash: {}", e))
+                    })?;
+
+                if !hash_output.status.success() {
+                    return Err(NixServeError::nix_daemon(
+                        "Failed to query hash information".to_string(),
+                    ));
+                }
+
+                let hash = String::from_utf8(hash_output.stdout)
+                    .map_err(|e| {
+                        NixServeError::internal(format!("Invalid UTF-8 in hash output: {}", e))
+                    })?
+                    .trim()
+                    .to_string();
+
+                // Get NAR size
+                let size_output = tokio::process::Command::new("nix-store")
+                    .arg("--query")
+                    .arg("--size")
+                    .arg(store_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to query size: {}", e))
+                    })?;
+
+                if !size_output.status.success() {
+                    return Err(NixServeError::nix_daemon(
+                        "Failed to query size information".to_string(),
+                    ));
+                }
+
+                let nar_size = String::from_utf8(size_output.stdout)
+                    .map_err(|e| {
+                        NixServeError::internal(format!("Invalid UTF-8 in size output: {}", e))
+                    })?
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| NixServeError::internal(format!("Failed to parse size: {}", e)))?;
+
+                // Get references
+                let refs_output = tokio::process::Command::new("nix-store")
+                    .arg("--query")
+                    .arg("--references")
+                    .arg(store_path)
+                    .output()
+                    .await
+                    .map_err(|e| {
+                        NixServeError::nix_daemon(format!("Failed to query references: {}", e))
+                    })?;
+
+                if !refs_output.status.success() {
+                    return Err(NixServeError::nix_daemon(
+                        "Failed to query references information".to_string(),
+                    ));
+                }
+
+                let references = String::from_utf8(refs_output.stdout)
+                    .map_err(|e| {
+                        NixServeError::internal(format!("Invalid UTF-8 in refs output: {}", e))
+                    })?
+                    .lines()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+
+                // Construct a basic PathInfo
+                PathInfo {
+                    deriver: None,
+                    hash,
+                    references,
+                    registration_time: 0,
+                    nar_size,
+                    ultimate: false,
+                    sigs: Vec::new(),
+                    content_address: None,
+                }
+            }
+        };
+
         // Determine the directory to store narinfo files
-        // This typically matches the logic in store_nar
         let store_root = Path::new(&self.real_store);
         let narinfo_dir = if store_root.is_absolute() {
             store_root
@@ -337,14 +592,28 @@ impl NixStore {
             store_root.to_path_buf()
         };
 
+        // Make sure the directory exists
+        tokio::fs::create_dir_all(&narinfo_dir).await.map_err(|e| {
+            NixServeError::internal(format!("Failed to create narinfo directory: {}", e))
+        })?;
+
+        // Create URL based on compression settings
+        let url = if self.config.compress_nars {
+            format!("nar/{}.nar.{}", hash_part, self.config.compression_format)
+        } else {
+            format!("nar/{}.nar", hash_part)
+        };
+
         // Create narinfo content
-        let narinfo_content = format!(
-            "StorePath: {}\nURL: nar/{}.nar\nCompression: none\nNarHash: {}\nNarSize: {}\nReferences: {}\n",
+        let narinfo_content =
+            format!(
+            "StorePath: {}\nURL: {}\nCompression: {}\nNarHash: {}\nNarSize: {}\nReferences: {}\n",
             store_path,
-            hash_part,
+            url,
+            if self.config.compress_nars { &self.config.compression_format } else { "none" },
             path_info.hash,
             path_info.nar_size,
-            path_info.references.join(" ")
+            path_info.reference_basenames().join(" ")
         );
 
         // Write narinfo file
