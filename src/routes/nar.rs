@@ -19,6 +19,7 @@ use crate::routes::{full_body, internal_error, not_found};
 
 /// Represents the query string of a NAR URL.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct NarRequest {
     hash: Option<String>,
     outhash: Option<String>,
@@ -26,6 +27,7 @@ pub struct NarRequest {
 
 /// Represents the parsed parts in a NAR URL.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct PathParams {
     narhash: String,
     outhash: Option<String>,
@@ -53,8 +55,8 @@ fn parse_nar_path(path: &str) -> Result<(String, Option<String>, bool)> {
     // Check if the path is compressed
     let is_compressed = path.ends_with(".nar.xz");
 
-    // Remove the leading slash
-    let base_path = path.trim_start_matches('/');
+    // Remove the leading slash and "nar/" prefix
+    let base_path = path.trim_start_matches('/').trim_start_matches("nar/");
 
     // Extract the filename part without extensions
     let path_without_ext = if is_compressed {
@@ -66,7 +68,8 @@ fn parse_nar_path(path: &str) -> Result<(String, Option<String>, bool)> {
     // Check if it's a nix-serve style URL or our style
     if let Some((outhash, narhash)) = path_without_ext.split_once('-') {
         // nix-serve style: /nar/{outhash}-{narhash}.nar(.xz)
-        if outhash.len() != 32 {
+        // Allow both 32 and 36 chars for compatibility with different hash formats
+        if outhash.len() != 32 && outhash.len() != 36 {
             return Err(anyhow!(
                 "Invalid output hash length in path: {}",
                 outhash.len()
@@ -79,9 +82,13 @@ fn parse_nar_path(path: &str) -> Result<(String, Option<String>, bool)> {
             is_compressed,
         ))
     } else {
-        // Our style: /nar/{narhash}.nar(.xz)?hash={outhash}
-        // Or handling direct nar request without the format check
-        Ok((path_without_ext.to_string(), None, is_compressed))
+        // Direct style: /nar/{hash}.nar(.xz)
+        // This is what nix copy uses when uploading
+        let hash = path_without_ext.to_string();
+
+        // When there's only one hash in the path, treat it as both narhash and outhash
+        // This allows direct uploads from nix copy
+        Ok((hash.clone(), Some(hash), is_compressed))
     }
 }
 
@@ -388,12 +395,10 @@ pub async fn put(
     let hash_part = match hash_part_opt {
         Some(hash) => hash,
         None => {
-            debug!("Missing hash part in NAR upload path");
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "text/plain")
-                .body(full_body("Missing hash part in upload path"))
-                .unwrap());
+            // If no hash part is provided in the path, use the NAR hash as the hash part
+            // This is a fallback for direct uploads
+            debug!("No explicit hash part in NAR upload path, using NAR hash");
+            narhash.clone()
         }
     };
 
@@ -556,4 +561,61 @@ pub async fn head(
         .header("Cache-Control", "max-age=31536000") // 1 year
         .body(full_body(""))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_nar_path_simple() {
+        let path = "/nar/abcdef1234567890.nar";
+        let (narhash, outhash, is_compressed) = parse_nar_path(path).unwrap();
+        assert_eq!(narhash, "abcdef1234567890");
+        assert_eq!(outhash.unwrap(), "abcdef1234567890");
+        assert_eq!(is_compressed, false);
+    }
+
+    #[test]
+    fn test_parse_nar_path_compressed() {
+        let path = "/nar/abcdef1234567890.nar.xz";
+        let (narhash, outhash, is_compressed) = parse_nar_path(path).unwrap();
+        assert_eq!(narhash, "abcdef1234567890");
+        assert_eq!(outhash.unwrap(), "abcdef1234567890");
+        assert_eq!(is_compressed, true);
+    }
+
+    #[test]
+    fn test_parse_nar_path_with_separate_hashes() {
+        let path = "/nar/00000000000000000000000000000000-abcdef1234567890.nar";
+        let (narhash, outhash, is_compressed) = parse_nar_path(path).unwrap();
+        assert_eq!(narhash, "abcdef1234567890");
+        assert_eq!(outhash.unwrap(), "00000000000000000000000000000000");
+        assert_eq!(is_compressed, false);
+    }
+
+    #[test]
+    fn test_parse_nar_path_with_separate_hashes_compressed() {
+        let path = "/nar/00000000000000000000000000000000-abcdef1234567890.nar.xz";
+        let (narhash, outhash, is_compressed) = parse_nar_path(path).unwrap();
+        assert_eq!(narhash, "abcdef1234567890");
+        assert_eq!(outhash.unwrap(), "00000000000000000000000000000000");
+        assert_eq!(is_compressed, true);
+    }
+
+    #[test]
+    fn test_parse_nar_path_nix_copy_format() {
+        // Format utilisé par nix copy
+        let path = "/nar/08242al70hn299yh1vk6il2cyahh6p86qvm72rmqz1z07q36vsk2.nar.xz";
+        let (narhash, outhash, is_compressed) = parse_nar_path(path).unwrap();
+        assert_eq!(
+            narhash,
+            "08242al70hn299yh1vk6il2cyahh6p86qvm72rmqz1z07q36vsk2"
+        );
+        assert_eq!(
+            outhash.unwrap(),
+            "08242al70hn299yh1vk6il2cyahh6p86qvm72rmqz1z07q36vsk2"
+        );
+        assert_eq!(is_compressed, true);
+    }
 }
