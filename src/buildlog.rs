@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::Response;
@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error};
 
 use crate::config::Config;
-use crate::routes::{full_body, not_found};
+use crate::routes::not_found;
 use crate::store::Store;
 
 /// Get the path to a build log file for a derivation
@@ -65,7 +65,7 @@ fn is_compressed_log(path: &Path) -> bool {
 /// Handler for the /log/{hash} endpoint
 pub async fn get(
     drv: &str,
-    config: &Arc<Config>,
+    _config: &Arc<Config>,
     store: &Arc<Store>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("Build log request for: {}", drv);

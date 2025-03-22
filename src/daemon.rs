@@ -4,7 +4,6 @@ use std::str;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
-    sync::Mutex,
 };
 use tracing::{debug, warn};
 
@@ -297,6 +296,94 @@ async fn write_string_list(socket: &mut UnixStream, list: &[String]) -> Result<(
     Ok(())
 }
 
+// Traiter les messages d'erreur et de statut du démon (version statique)
+async fn process_daemon_messages(socket: &mut UnixStream) -> Result<()> {
+    loop {
+        let msg_code = read_num::<u64>(socket)
+            .await
+            .context("Failed to read message code")?;
+
+        match Msg::try_from(msg_code) {
+            Ok(Msg::Write) => {
+                let msg = read_string(socket).await?;
+                debug!("[nix-daemon] write: {}", msg);
+            }
+            Ok(Msg::Error) => {
+                let err_type = read_string(socket)
+                    .await
+                    .context("Failed to read error type")?;
+                let level = read_num::<u64>(socket)
+                    .await
+                    .context("Failed to read error level")?;
+                let _name = read_string(socket)
+                    .await
+                    .context("Failed to read error name")?;
+                let message = read_string(socket)
+                    .await
+                    .context("Failed to read error message")?;
+                let _have_pos = read_num::<u64>(socket)
+                    .await
+                    .context("Failed to read error position flag")?;
+
+                let traces_len = read_num::<u64>(socket)
+                    .await
+                    .context("Failed to read number of traces")?;
+                for _ in 0..traces_len {
+                    let _have_pos = read_num::<u64>(socket)
+                        .await
+                        .context("Failed to read trace position flag")?;
+                    let _trace = read_string(socket).await.context("Failed to read trace")?;
+                }
+
+                warn!(
+                    "Daemon error: {} (type: {}, level: {})",
+                    message, err_type, level
+                );
+
+                bail!("Daemon error: {}", message);
+            }
+            Ok(Msg::Next) => {
+                let msg = read_string(socket).await?;
+                debug!("[nix-daemon] next: {}", msg);
+            }
+            Ok(Msg::StartActivity) => {
+                let _act = read_num::<u64>(socket).await?;
+                let _lvl = read_num::<u64>(socket).await?;
+                let _typ = read_num::<u64>(socket).await?;
+                let s = read_string(socket).await?;
+
+                let field_type = read_num::<u64>(socket).await?;
+                if field_type == 0 {
+                    let _field = read_num::<u64>(socket).await?;
+                } else if field_type == 1 {
+                    let _field = read_string(socket).await?;
+                } else {
+                    bail!("Unknown field type: {}", field_type);
+                }
+
+                let _parent = read_num::<u64>(socket).await?;
+
+                debug!("[nix-daemon] start activity: {}", s);
+            }
+            Ok(Msg::StopActivity) => {
+                let _act = read_num::<u64>(socket).await?;
+                debug!("[nix-daemon] stop activity");
+            }
+            Ok(Msg::Result) => {
+                let res = read_string(socket).await?;
+                debug!("[nix-daemon] result: {}", res);
+            }
+            Ok(Msg::Last) => {
+                debug!("[nix-daemon] last message");
+                return Ok(());
+            }
+            Err(e) => {
+                bail!("Unknown stderr message type: {} - {}", msg_code, e);
+            }
+        }
+    }
+}
+
 impl DaemonConnection {
     // Établir ou réutiliser une connexion
     async fn connect(&mut self) -> Result<&mut UnixStream> {
@@ -361,7 +448,7 @@ impl DaemonConnection {
         );
 
         // Traiter les messages stderr initiaux
-        self.forward_stderr(socket).await?;
+        process_daemon_messages(socket).await?;
 
         debug!("Handshake completed successfully");
 
@@ -370,94 +457,6 @@ impl DaemonConnection {
             daemon_version,
             is_trusted,
         })
-    }
-
-    // Traiter les messages d'erreur et de statut du démon
-    async fn forward_stderr(&self, socket: &mut UnixStream) -> Result<()> {
-        loop {
-            let msg_code = read_num::<u64>(socket)
-                .await
-                .context("Failed to read message code")?;
-
-            match Msg::try_from(msg_code) {
-                Ok(Msg::Write) => {
-                    let msg = read_string(socket).await?;
-                    debug!("[nix-daemon] write: {}", msg);
-                }
-                Ok(Msg::Error) => {
-                    let err_type = read_string(socket)
-                        .await
-                        .context("Failed to read error type")?;
-                    let level = read_num::<u64>(socket)
-                        .await
-                        .context("Failed to read error level")?;
-                    let name = read_string(socket)
-                        .await
-                        .context("Failed to read error name")?;
-                    let message = read_string(socket)
-                        .await
-                        .context("Failed to read error message")?;
-                    let have_pos = read_num::<u64>(socket)
-                        .await
-                        .context("Failed to read error position flag")?;
-
-                    let traces_len = read_num::<u64>(socket)
-                        .await
-                        .context("Failed to read number of traces")?;
-                    for _ in 0..traces_len {
-                        let _have_pos = read_num::<u64>(socket)
-                            .await
-                            .context("Failed to read trace position flag")?;
-                        let _trace = read_string(socket).await.context("Failed to read trace")?;
-                    }
-
-                    warn!(
-                        "Daemon error: {} (type: {}, level: {})",
-                        message, err_type, level
-                    );
-
-                    bail!("Daemon error: {}", message);
-                }
-                Ok(Msg::Next) => {
-                    let msg = read_string(socket).await?;
-                    debug!("[nix-daemon] next: {}", msg);
-                }
-                Ok(Msg::StartActivity) => {
-                    let act = read_num::<u64>(socket).await?;
-                    let lvl = read_num::<u64>(socket).await?;
-                    let typ = read_num::<u64>(socket).await?;
-                    let s = read_string(socket).await?;
-
-                    let field_type = read_num::<u64>(socket).await?;
-                    if field_type == 0 {
-                        let _field = read_num::<u64>(socket).await?;
-                    } else if field_type == 1 {
-                        let _field = read_string(socket).await?;
-                    } else {
-                        bail!("Unknown field type: {}", field_type);
-                    }
-
-                    let _parent = read_num::<u64>(socket).await?;
-
-                    debug!("[nix-daemon] start activity: {}", s);
-                }
-                Ok(Msg::StopActivity) => {
-                    let _act = read_num::<u64>(socket).await?;
-                    debug!("[nix-daemon] stop activity");
-                }
-                Ok(Msg::Result) => {
-                    let res = read_string(socket).await?;
-                    debug!("[nix-daemon] result: {}", res);
-                }
-                Ok(Msg::Last) => {
-                    debug!("[nix-daemon] last message");
-                    return Ok(());
-                }
-                Err(e) => {
-                    bail!("Unknown stderr message type: {} - {}", msg_code, e);
-                }
-            }
-        }
     }
 
     // Envoyer une opération au démon
@@ -480,7 +479,8 @@ impl DaemonConnection {
             .await
             .context("Failed to write path")?;
 
-        self.forward_stderr(socket).await?;
+        // Utiliser la fonction statique au lieu de la méthode
+        process_daemon_messages(socket).await?;
 
         let valid = read_num::<u64>(socket)
             .await
@@ -501,7 +501,8 @@ impl DaemonConnection {
             .await
             .context("Failed to write hash part")?;
 
-        self.forward_stderr(socket).await?;
+        // Utiliser la fonction statique
+        process_daemon_messages(socket).await?;
 
         let path = read_string(socket).await.context("Failed to read path")?;
 
@@ -525,7 +526,8 @@ impl DaemonConnection {
             .await
             .context("Failed to write path")?;
 
-        self.forward_stderr(socket).await?;
+        // Utiliser la fonction statique
+        process_daemon_messages(socket).await?;
 
         // Lire le flag d'existence
         let exists = read_num::<u64>(socket)
@@ -595,7 +597,8 @@ impl DaemonConnection {
             .await
             .context("Failed to write store path")?;
 
-        self.forward_stderr(socket).await?;
+        // Utiliser la fonction statique
+        process_daemon_messages(socket).await?;
 
         // Lire les chunks de données
         loop {

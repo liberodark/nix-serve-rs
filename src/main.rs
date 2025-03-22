@@ -31,7 +31,6 @@ mod store;
 mod version;
 
 use config::{ArgsProvider, Config};
-use error::NixServeError;
 use store::Store;
 
 /// Command line arguments
@@ -140,9 +139,7 @@ async fn handle_request(
         }
 
         // NAR PUT requests (uploads)
-        ("PUT", _) if path.starts_with("/nar/") => {
-            nar::put(path, body, &config, &store).await
-        }
+        ("PUT", _) if path.starts_with("/nar/") => nar::put(path, body, &config, &store).await,
 
         // NAR GET requests
         ("GET", _) if path.starts_with("/nar/") => {
@@ -194,11 +191,7 @@ fn full_body(body: &str) -> BoxBody<Bytes, Infallible> {
     Full::new(Bytes::from(body.to_string())).boxed()
 }
 
-async fn run_tcp_server(
-    addr: SocketAddr,
-    config: Arc<Config>,
-    store: Arc<Store>,
-) -> Result<()> {
+async fn run_tcp_server(addr: SocketAddr, config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     info!("Listening on TCP {}", addr);
 
     let listener = TcpListener::bind(addr)
@@ -265,11 +258,7 @@ async fn run_tcp_server(
     Ok(())
 }
 
-async fn run_unix_server(
-    path: &str,
-    config: Arc<Config>,
-    store: Arc<Store>,
-) -> Result<()> {
+async fn run_unix_server(path: &str, config: Arc<Config>, store: Arc<Store>) -> Result<()> {
     info!("Listening on Unix socket {}", path);
 
     // Remove existing socket if it exists
@@ -376,7 +365,9 @@ async fn run_server(args: Args) -> Result<()> {
     }
 
     if let Some(sign_key) = args.sign_key() {
-        config.sign_key_paths.push(std::path::PathBuf::from(sign_key));
+        config
+            .sign_key_paths
+            .push(std::path::PathBuf::from(sign_key));
     }
 
     if let Some(compress) = args.compress_nars() {
@@ -404,7 +395,7 @@ async fn run_server(args: Args) -> Result<()> {
 
     // Create shared config and store
     let config = Arc::new(config);
-    let store = Arc::clone(&config.store);
+    let store = Arc::new(config.store.clone());
 
     info!("Starting nix-serve-rs v{}", env!("CARGO_PKG_VERSION"));
     info!("Binding to {}", config.bind);
@@ -412,7 +403,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Determine if we're binding to TCP or Unix socket
     if config.bind.starts_with("unix:") {
         let socket_path = &config.bind[5..];
-        run_unix_server(socket_path, config, store).await
+        run_unix_server(socket_path, Arc::clone(&config), store).await
     } else {
         let addr: SocketAddr = config
             .bind
@@ -437,9 +428,7 @@ async fn main() -> Result<()> {
     };
 
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .init();
+    tracing_subscriber::fmt().with_max_level(log_level).init();
 
     // Run the server
     run_server(args).await

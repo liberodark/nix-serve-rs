@@ -4,9 +4,9 @@ use http::{Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use crate::config::Config;
 use crate::routes::{full_body, not_found};
@@ -105,6 +105,7 @@ async fn generate_narinfo(
         .await
         .query_path_info(store_path)
         .await?
+        .path
     {
         Some(info) => info,
         None => return Ok(None),
@@ -117,7 +118,8 @@ async fn generate_narinfo(
         let parts: Vec<&str> = path_info.hash.splitn(2, ':').collect();
         (parts[0], parts[1])
     } else {
-        ("sha256", &path_info.hash)
+        // Convertir String en &str avec as_str()
+        ("sha256", path_info.hash.as_str())
     };
 
     let nar_hash_base32 =
@@ -268,7 +270,7 @@ pub async fn put(
     hash: &str,
     body: Bytes,
     config: &Arc<Config>,
-    store: &Arc<Store>,
+    _store: &Arc<Store>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("Processing narinfo upload for hash: {}", hash);
 

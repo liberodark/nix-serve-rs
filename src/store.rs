@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -8,7 +8,7 @@ use crate::daemon::DaemonConnection;
 use crate::error::{NixServeError, NixServeResult};
 
 /// Manages access to the Nix store, handling virtual and real paths
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Store {
     /// Virtual store path (as seen by clients)
     virtual_store: String,

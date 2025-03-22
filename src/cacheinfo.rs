@@ -29,7 +29,6 @@ pub async fn get(config: &Arc<Config>) -> Result<Response<BoxBody<Bytes, Infalli
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::routes::full_body;
     use crate::store::Store;
     use http_body_util::BodyExt;
 

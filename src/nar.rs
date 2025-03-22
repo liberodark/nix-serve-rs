@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use http::{HeaderMap, Request, Response, StatusCode};
+use http::{HeaderMap, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::StreamBody;
 use http_range::HttpRange;
@@ -13,16 +13,9 @@ use tokio::process::Command;
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::error::NixServeError;
 use crate::routes::{full_body, internal_error, not_found};
 use crate::signing::convert_base16_to_nix32;
 use crate::store::Store;
-
-/// Represents the query parameters of a NAR URL
-#[derive(Debug)]
-struct NarQuery {
-    hash: Option<String>,
-}
 
 /// Parse the query string of a NAR request to extract the hash parameter
 fn parse_query(query: Option<&str>) -> Option<String> {
@@ -151,6 +144,7 @@ pub async fn head(
         .await
         .query_path_info(&store_path)
         .await?
+        .path
     {
         Some(info) => info,
         None => {
@@ -251,6 +245,7 @@ pub async fn get(
         .await
         .query_path_info(&store_path)
         .await?
+        .path
     {
         Some(info) => {
             debug!("Found path info for: {}", store_path);
@@ -386,12 +381,15 @@ async fn handle_range_request(
     let mut reader = tokio::io::BufReader::new(file);
     tokio::io::AsyncSeekExt::seek(&mut reader, std::io::SeekFrom::Start(start)).await?;
 
-    // Take only the range length
-    let range_reader = reader.take(end - start + 1);
-    let stream = tokio_util::io::ReaderStream::new(range_reader);
+    // Create a stream with a fixed capacity
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 8192);
+
+    // Limit the stream to the requested range length - convert u64 to usize safely
+    let range_length = (end - start + 1) as usize;
+    let limited_stream = stream.take(range_length);
 
     // Map the stream for hyper
-    let mapped_stream = stream.map(|result| match result {
+    let mapped_stream = limited_stream.map(|result| match result {
         Ok(chunk) => Ok(Frame::data(chunk)),
         Err(e) => {
             error!("Error streaming NAR: {}", e);
@@ -425,7 +423,7 @@ async fn handle_range_request(
 async fn handle_compressed_nar(
     store_path: &str,
     config: &Arc<Config>,
-    nar_size: u64,
+    _nar_size: u64,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("Handling compressed NAR request for {}", store_path);
 
@@ -549,7 +547,14 @@ async fn handle_uncompressed_nar(
 
     // Convert the receiver into a stream
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = BoxBody::new(StreamBody::new(stream));
+
+    // Map the stream for hyper
+    let mapped_stream = stream.map(|result| match result {
+        Ok(bytes) => Ok(Frame::data(bytes)),
+        Err(_) => Ok(Frame::data(Bytes::new())),
+    });
+
+    let body = BoxBody::new(StreamBody::new(mapped_stream));
 
     Ok(Response::builder()
         .header("Content-Type", content_type)
@@ -565,7 +570,7 @@ pub async fn put(
     path: &str,
     body: Bytes,
     config: &Arc<Config>,
-    store: &Arc<Store>,
+    _store: &Arc<Store>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("Processing NAR upload: {}", path);
 
@@ -677,7 +682,7 @@ async fn create_narinfo_for_path(
     config: &Arc<Config>,
 ) -> Result<()> {
     // Extract basename from the store path (e.g., "abcdef-foo" from "/nix/store/abcdef-foo")
-    let basename = store_path
+    let _basename = store_path
         .split('/')
         .last()
         .ok_or_else(|| anyhow::anyhow!("Invalid store path"))?;
