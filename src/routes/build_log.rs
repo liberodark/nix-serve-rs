@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error};
 
 use crate::config::Config;
-use crate::nix::store::NixStore;
+use crate::nix::store_socket::NixStore;
 use crate::routes::not_found;
 
 /// Get the path to a build log file for a derivation

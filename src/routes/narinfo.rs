@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::crypto::signing::{convert_base16_to_nix32, fingerprint_path};
-use crate::nix::store::NixStore;
+use crate::nix::store_socket::NixStore;
 use crate::routes::{full_body, not_found};
 
 /// NARInfo structure representing a NAR file's metadata

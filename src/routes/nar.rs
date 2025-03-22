@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 use crate::config::Config;
 use crate::crypto::signing::convert_base16_to_nix32;
 use crate::nix::nar;
-use crate::nix::store::NixStore;
+use crate::nix::store_socket::NixStore;
 use crate::routes::{full_body, internal_error, not_found};
 
 /// Represents the query string of a NAR URL.

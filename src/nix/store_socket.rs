@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::error::{NixServeError, NixServeResult};
-use crate::nix::daemon::NixDaemon;
-use crate::nix::PathInfo;
+use crate::nix::daemon_protocol::{NixDaemonProtocol, PathInfo as DaemonPathInfo};
+use crate::nix::path_info::PathInfo;
 
-// Cache for path info to reduce duplicate queries
+// Cache structure to reduce duplicate queries
 struct PathInfoCache {
     cache: HashMap<String, PathInfo>,
     max_size: usize,
@@ -46,23 +45,37 @@ impl PathInfoCache {
 pub struct NixStore {
     virtual_store: String,
     real_store: String,
-    daemon: Arc<Mutex<NixDaemon>>,
+    daemon: Mutex<NixDaemonProtocol>,
     cache: Mutex<PathInfoCache>,
+}
+
+// Helper function to convert between PathInfo types
+fn convert_path_info(daemon_info: DaemonPathInfo) -> PathInfo {
+    PathInfo {
+        deriver: daemon_info.deriver,
+        hash: daemon_info.hash,
+        references: daemon_info.references,
+        registration_time: daemon_info.registration_time,
+        nar_size: daemon_info.nar_size,
+        ultimate: daemon_info.ultimate,
+        sigs: daemon_info.sigs,
+        content_address: daemon_info.content_address,
+    }
 }
 
 impl NixStore {
     pub fn new(virtual_store: &str, real_store: Option<&str>) -> Result<Self> {
-        info!("Initializing Nix store: virtual={}", virtual_store);
+        info!("Initializing Nix store (socket): virtual={}", virtual_store);
         if let Some(real) = real_store {
             info!("Using real Nix store: {}", real);
         }
 
-        let daemon = NixDaemon::new()?;
+        let daemon = NixDaemonProtocol::new();
 
         Ok(Self {
             virtual_store: virtual_store.to_string(),
             real_store: real_store.unwrap_or(virtual_store).to_string(),
-            daemon: Arc::new(Mutex::new(daemon)),
+            daemon: Mutex::new(daemon),
             cache: Mutex::new(PathInfoCache::new(1000)),
         })
     }
@@ -95,11 +108,14 @@ impl NixStore {
             }
         }
 
-        let mut daemon = self.daemon.lock().await;
-        daemon
-            .is_valid_path(path)
-            .await
-            .map_err(|e| NixServeError::nix_daemon(format!("Failed to check path validity: {}", e)))
+        // Use the protocol directly
+        match self.daemon.lock().await.is_valid_path(path).await {
+            Ok(valid) => Ok(valid),
+            Err(e) => Err(NixServeError::nix_daemon(format!(
+                "Failed to check path validity: {}",
+                e
+            ))),
+        }
     }
 
     pub async fn query_path_from_hash_part(
@@ -113,18 +129,70 @@ impl NixStore {
             let cache = self.cache.lock().await;
             for (path, _) in cache.cache.iter() {
                 if path.contains(hash_part) {
+                    debug!("Found path in cache: {}", path);
                     return Ok(Some(path.clone()));
                 }
             }
         }
 
-        let mut daemon = self.daemon.lock().await;
-        daemon
+        // Query from daemon directly
+        match self
+            .daemon
+            .lock()
+            .await
             .query_path_from_hash_part(hash_part)
             .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Try fallback command-line method if daemon fails
+                debug!("Daemon protocol failed, using fallback command: {}", e);
+                self.query_path_from_hash_part_fallback(hash_part).await
+            }
+        }
+    }
+
+    // Fallback method using command-line tools
+    async fn query_path_from_hash_part_fallback(
+        &self,
+        hash_part: &str,
+    ) -> NixServeResult<Option<String>> {
+        debug!(
+            "Using fallback command-line method for hash part: {}",
+            hash_part
+        );
+
+        let output = tokio::process::Command::new("nix-store")
+            .arg("--query")
+            .arg("--outputs")
+            .arg(format!("/nix/store/{}-*", hash_part))
+            .output()
+            .await
             .map_err(|e| {
-                NixServeError::nix_daemon(format!("Failed to query path from hash part: {}", e))
-            })
+                NixServeError::nix_daemon(format!("Failed to execute nix-store: {}", e))
+            })?;
+
+        if output.status.success() {
+            let path = String::from_utf8(output.stdout)
+                .map_err(|e| NixServeError::nix_daemon(format!("Invalid UTF-8 in output: {}", e)))?
+                .trim()
+                .to_string();
+
+            if path.is_empty() {
+                debug!("No path found for hash part (fallback): {}", hash_part);
+                Ok(None)
+            } else {
+                debug!(
+                    "Found path for hash part {} (fallback): {}",
+                    hash_part, path
+                );
+                Ok(Some(path))
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            debug!("nix-store command failed: {}", stderr);
+            Ok(None)
+        }
     }
 
     pub async fn query_path_info(&self, path: &str) -> NixServeResult<Option<PathInfo>> {
@@ -137,19 +205,28 @@ impl NixStore {
         }
 
         // Not in cache, query from daemon
-        let mut daemon = self.daemon.lock().await;
-        let result = daemon
-            .query_path_info(path)
-            .await
-            .map_err(|e| NixServeError::nix_daemon(format!("Failed to query path info: {}", e)))?;
+        match self.daemon.lock().await.query_path_info(path).await {
+            Ok(daemon_info) => {
+                // Convert from daemon's PathInfo to our PathInfo
+                let path_info = convert_path_info(daemon_info);
 
-        // Update cache if found
-        if let Some(ref info) = result {
-            let mut cache = self.cache.lock().await;
-            cache.insert(path.to_string(), info.clone());
+                // Update cache
+                let mut cache = self.cache.lock().await;
+                cache.insert(path.to_string(), path_info.clone());
+
+                Ok(Some(path_info))
+            }
+            Err(e) => {
+                if e.to_string().contains("Path not found") {
+                    Ok(None) // Path not found
+                } else {
+                    Err(NixServeError::nix_daemon(format!(
+                        "Failed to query path info: {}",
+                        e
+                    )))
+                }
+            }
         }
-
-        Ok(result)
     }
 
     // Store a NAR file in the cache
@@ -157,7 +234,7 @@ impl NixStore {
         &self,
         hash_part: &str,
         nar_hash: &str,
-        data: bytes::Bytes,
+        data: Bytes,
     ) -> NixServeResult<PathBuf> {
         // Create the directory structure if it doesn't exist
         let store_root = Path::new(&self.real_store);
@@ -203,69 +280,22 @@ impl NixStore {
     pub async fn import_nar(&self, nar_path: &Path) -> NixServeResult<String> {
         debug!("Importing NAR file: {}", nar_path.display());
 
-        let output = Command::new("nix-store")
-            .arg("--import")
-            .arg(nar_path)
-            .output()
+        // Read the NAR file
+        let nar_data = tokio::fs::read(nar_path)
             .await
-            .map_err(|e| NixServeError::nix_daemon(format!("Failed to import NAR: {}", e)))?;
+            .map_err(|e| NixServeError::nix_daemon(format!("Failed to read NAR file: {}", e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NixServeError::nix_daemon(format!(
-                "Failed to import NAR: {}",
-                stderr
-            )));
-        }
-
-        let store_path = String::from_utf8(output.stdout)
-            .map_err(|e| {
-                NixServeError::internal(format!("Invalid UTF-8 in nix-store output: {}", e))
-            })?
-            .trim()
-            .to_string();
-
-        info!("Imported NAR to store path: {}", store_path);
-
-        Ok(store_path)
-    }
-
-    // Get the list of references for a path
-    pub async fn query_references(&self, path: &str) -> NixServeResult<Vec<String>> {
-        // Check cache first
-        {
-            let cache = self.cache.lock().await;
-            if let Some(info) = cache.get(path) {
-                return Ok(info.references.clone());
+        // Import the NAR using the daemon protocol
+        match self.daemon.lock().await.import_nar(&nar_data).await {
+            Ok(store_path) => {
+                info!("Imported NAR to store path: {}", store_path);
+                Ok(store_path)
             }
+            Err(e) => Err(NixServeError::nix_daemon(format!(
+                "Failed to import NAR: {}",
+                e
+            ))),
         }
-
-        debug!("Querying references for {}", path);
-        let output = Command::new("nix-store")
-            .arg("--query")
-            .arg("--references")
-            .arg(path)
-            .output()
-            .await
-            .map_err(|e| NixServeError::nix_daemon(format!("Failed to query references: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NixServeError::nix_daemon(format!(
-                "Failed to query references: {}",
-                stderr
-            )));
-        }
-
-        let refs = String::from_utf8(output.stdout)
-            .map_err(|e| {
-                NixServeError::internal(format!("Invalid UTF-8 in nix-store output: {}", e))
-            })?
-            .lines()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-
-        Ok(refs)
     }
 
     // Add a NAR to the binary cache
@@ -314,7 +344,7 @@ impl NixStore {
             hash_part,
             path_info.hash,
             path_info.nar_size,
-            path_info.reference_basenames().join(" ")
+            path_info.references.join(" ")
         );
 
         // Write narinfo file

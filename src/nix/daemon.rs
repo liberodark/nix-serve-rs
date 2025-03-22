@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::nix::path_info::PathInfo;
+use crate::nix::PathInfo;
 
 /// Communication with the Nix daemon
 ///

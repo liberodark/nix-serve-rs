@@ -17,7 +17,7 @@ use tokio::signal;
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::nix::store::NixStore;
+use crate::nix::store_socket::NixStore;
 use crate::routes;
 
 pub struct Server {
