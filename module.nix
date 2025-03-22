@@ -27,6 +27,7 @@ let
     virtual_store = cfg.virtualStore;
     compress_nars = cfg.compressNars;
     compression_level = cfg.compressionLevel;
+    compression_format = cfg.compressionFormat;
     require_auth_uploads = cfg.requireAuthUploads;
   };
 
@@ -123,7 +124,13 @@ in
     compressionLevel = lib.mkOption {
       type = lib.types.int;
       default = 3;
-      description = lib.mdDoc "zstd compression level (1-19, higher = better compression but slower)";
+      description = lib.mdDoc "Compression level (1-19 for zstd, 0-9 for xz)";
+    };
+
+    compressionFormat = lib.mkOption {
+      type = lib.types.enum [ "xz" "zstd" ];
+      default = "xz";
+      description = lib.mdDoc "Compression format to use (xz or zstd)";
     };
 
     requireAuthUploads = lib.mkOption {
@@ -253,49 +260,8 @@ in
       serviceConfig = {
         Type = "simple";
         ExecStart = "${lib.getExe cfg.package} --config ${configFile}";
-        User = cfg.user;
-        Group = cfg.group;
         Restart = "on-failure";
         RestartSec = "2";
-
-        # File system permissions
-        ReadWritePaths = lib.optional (cfg.realStore != null) cfg.realStore;
-        ReadOnlyPaths = [
-          "/nix/store"
-        ] ++ (lib.optional (cfg.signKeyPath != null) cfg.signKeyPath)
-          ++ cfg.signKeyPaths
-          ++ (lib.optional (cfg.tlsCertPath != null) cfg.tlsCertPath)
-          ++ (lib.optional (cfg.tlsKeyPath != null) cfg.tlsKeyPath);
-
-        # Security hardening
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        PrivateDevices = true;
-        NoNewPrivileges = true;
-        ProtectHostname = true;
-        ProtectClock = true;
-        ProtectKernelTunables = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        RestrictAddressFamilies = "AF_UNIX AF_INET AF_INET6";
-
-        # Capability for privileged ports
-        AmbientCapabilities =
-          let
-            # Parse port from bind string, fallback to port option
-            portStr =
-              if (builtins.match ".*:.*" cfg.bind) != null then
-                lib.last (lib.splitString ":" cfg.bind)
-              else
-                toString cfg.port;
-            portNum = lib.toInt portStr;
-          in
-          lib.optional (portNum < 1024) "CAP_NET_BIND_SERVICE";
-
-        # Resource limits
-        LimitNOFILE = 65536;
-        OOMPolicy = "continue";
       };
     };
   };

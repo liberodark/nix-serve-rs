@@ -160,11 +160,17 @@ impl NixStore {
         data: bytes::Bytes,
     ) -> NixServeResult<PathBuf> {
         // Create the directory structure if it doesn't exist
-        let real_store_str = self.real_store().to_string();
-        let parent_path = Path::new(&real_store_str)
-            .parent()
-            .ok_or_else(|| NixServeError::internal("Cannot determine NAR directory"))?;
-        let nar_dir = parent_path.join("nar");
+        let store_root = Path::new(&self.real_store);
+        let nar_dir = if store_root.is_absolute() {
+            // If real_store is absolute like /nix/store, store NARs in parent/nar
+            let parent_path = store_root.parent().ok_or_else(|| {
+                NixServeError::internal("Cannot determine NAR directory, real_store has no parent")
+            })?;
+            parent_path.join("nar")
+        } else {
+            // If real_store is relative like in a custom location, create nar dir inside
+            store_root.join("nar")
+        };
 
         tokio::fs::create_dir_all(&nar_dir).await.map_err(|e| {
             NixServeError::internal(format!("Failed to create NAR directory: {}", e))
@@ -276,12 +282,6 @@ impl NixStore {
             .await?
             .ok_or_else(|| NixServeError::path_not_found(store_path.to_string()))?;
 
-        // Check if we have a narinfo directory
-        let real_store_str = self.real_store().to_string();
-        let parent_path = Path::new(&real_store_str)
-            .parent()
-            .ok_or_else(|| NixServeError::internal("Cannot determine narinfo directory"))?;
-
         // Extract hash part from store path
         let hash_part = store_path
             .split('/')
@@ -290,6 +290,22 @@ impl NixStore {
             .ok_or_else(|| {
                 NixServeError::internal(format!("Invalid store path format: {}", store_path))
             })?;
+
+        // Determine the directory to store narinfo files
+        // This typically matches the logic in store_nar
+        let store_root = Path::new(&self.real_store);
+        let narinfo_dir = if store_root.is_absolute() {
+            store_root
+                .parent()
+                .ok_or_else(|| {
+                    NixServeError::internal(
+                        "Cannot determine narinfo directory, real_store has no parent",
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            store_root.to_path_buf()
+        };
 
         // Create narinfo content
         let narinfo_content = format!(
@@ -302,12 +318,16 @@ impl NixStore {
         );
 
         // Write narinfo file
-        let narinfo_path = parent_path.join(format!("{}.narinfo", hash_part));
+        let narinfo_path = narinfo_dir.join(format!("{}.narinfo", hash_part));
         tokio::fs::write(&narinfo_path, narinfo_content)
             .await
             .map_err(|e| NixServeError::internal(format!("Failed to write narinfo file: {}", e)))?;
 
-        info!("Added {} to binary cache", store_path);
+        info!(
+            "Added {} to binary cache with narinfo at {}",
+            store_path,
+            narinfo_path.display()
+        );
 
         Ok(())
     }

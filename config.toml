@@ -38,3 +38,6 @@ compress_nars = false
 
 # zstd compression level (1-19, higher = better compression but slower)
 compression_level = 3
+
+# Compression format (xz or zstd)
+compression_format = "xz"

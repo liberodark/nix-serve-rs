@@ -20,6 +20,18 @@ struct Args {
 
     #[clap(long, env = "NIX_SECRET_KEY_FILE")]
     sign_key: Option<String>,
+
+    /// Whether to compress NARs when serving them
+    #[clap(long, env = "NIX_SERVE_COMPRESS_NARS")]
+    compress_nars: Option<bool>,
+
+    /// Compression level (1-19 for zstd, 0-9 for xz)
+    #[clap(long, env = "NIX_SERVE_COMPRESSION_LEVEL")]
+    compression_level: Option<i32>,
+
+    /// Compression format (xz or zstd)
+    #[clap(long, env = "NIX_SERVE_COMPRESSION_FORMAT")]
+    compression_format: Option<String>,
 }
 
 impl ArgsProvider for Args {
@@ -34,6 +46,10 @@ impl ArgsProvider for Args {
     fn sign_key(&self) -> Option<String> {
         self.sign_key.clone()
     }
+
+    fn compress_nars(&self) -> Option<bool> {
+        self.compress_nars
+    }
 }
 
 #[tokio::main]
@@ -46,8 +62,17 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let config =
+    let mut config =
         Config::load(args.config.as_deref(), &args).context("Failed to load configuration")?;
+
+    // Apply command-line overrides that aren't part of the ArgsProvider trait
+    if let Some(level) = args.compression_level {
+        config.compression_level = level;
+    }
+
+    if let Some(format) = args.compression_format {
+        config.compression_format = format;
+    }
 
     info!("Starting nix-serve-rs v{}", env!("CARGO_PKG_VERSION"));
     info!("Binding to {}", config.bind);

@@ -42,11 +42,11 @@ pub async fn stream_nar_with_range(
     range: Option<&str>,
     total_size: u64,
 ) -> Result<(NarStream, u64, u64)> {
-    // Utiliser la même approche pour les deux cas: créer un fichier temporaire
+    // Use the same approach for both cases: create a temporary file
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path().join("temp.nar");
 
-    // Dump the NAR to a temp file in both cases
+    // Dump the NAR to a temp file
     Command::new("nix-store")
         .arg("--dump")
         .arg(&path)
@@ -107,8 +107,8 @@ pub async fn stream_nar_with_range(
 
         Ok((ReaderStream::new(limited_reader), start, end))
     } else {
-        // Pour le cas sans range, on utilise quand même la même approche avec un fichier temporaire
-        // mais on stream tout le fichier
+        // For the case without range, we still use the same approach with a temporary file
+        // but stream the entire file
         let reader = tokio::io::BufReader::new(file);
 
         // Take the entire file size (effectively no limit)
@@ -116,6 +116,63 @@ pub async fn stream_nar_with_range(
 
         Ok((ReaderStream::new(limited_reader), 0, total_size - 1))
     }
+}
+
+/// Stream a compressed NAR file
+///
+/// This function compresses a NAR file using external command
+pub async fn stream_compressed_nar(
+    path: PathBuf,
+    compression_format: &str,
+    compression_level: i32,
+) -> Result<Bytes> {
+    debug!("Creating compressed NAR for path: {}", path.display());
+
+    // Set up correct command and arguments based on the compression format
+    let (cmd, level_arg) = match compression_format {
+        "xz" => ("xz", format!("-{}", compression_level)),
+        "zstd" => ("zstd", format!("-{}", compression_level)),
+        _ => ("xz", "-3".to_string()), // Default to xz level 3 for unsupported formats
+    };
+
+    // First create temporary NAR file
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.path().join("temp.nar");
+
+    // Dump the NAR to a temp file
+    let dump_output = Command::new("nix-store")
+        .arg("--dump")
+        .arg(&path)
+        .arg("--to-file")
+        .arg(&temp_path)
+        .output()
+        .await
+        .context("Failed to create temporary NAR file")?;
+
+    if !dump_output.status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to dump NAR file: {}",
+            String::from_utf8_lossy(&dump_output.stderr)
+        ));
+    }
+
+    // Now compress using the specified format
+    let compress_output = Command::new(cmd)
+        .arg(level_arg)
+        .arg("-c")
+        .arg(&temp_path)
+        .output()
+        .await
+        .context(format!("Failed to execute {} compression", cmd))?;
+
+    if !compress_output.status.success() {
+        return Err(anyhow::anyhow!(
+            "Compression failed: {}",
+            String::from_utf8_lossy(&compress_output.stderr)
+        ));
+    }
+
+    Ok(Bytes::from(compress_output.stdout))
 }
 
 /// Calculate the hash of a NAR file
@@ -156,7 +213,7 @@ where
     let path = path.as_ref();
     debug!("Getting NAR size for path: {}", path.display());
 
-    // Option 1: Use nix-store --dump --to-file /dev/null and measure size
+    // Use nix-store --query --size to get the NAR size
     let output = Command::new("nix-store")
         .arg("--query")
         .arg("--size")
@@ -177,6 +234,42 @@ where
         .context("Failed to parse NAR size")?;
 
     Ok(size)
+}
+
+/// Decompress a NAR file
+pub async fn decompress_nar(compressed_data: &[u8], format: &str) -> Result<Bytes> {
+    let temp_dir = tempfile::tempdir()?;
+    let compressed_path = temp_dir.path().join("input.nar.compressed");
+
+    // Write the compressed data to a file
+    tokio::fs::write(&compressed_path, compressed_data).await?;
+
+    // Choose decompression command based on format
+    let (cmd, args) = match format {
+        "xz" => ("xz", vec!["-d", "-c"]),
+        "zstd" => ("zstd", vec!["-d", "-c"]),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unsupported compression format: {}",
+                format
+            ))
+        }
+    };
+
+    // Run decompression command
+    let output = Command::new(cmd)
+        .args(args)
+        .arg(compressed_path)
+        .output()
+        .await
+        .context(format!("Failed to run {} decompression", cmd))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Decompression failed: {}", stderr));
+    }
+
+    Ok(Bytes::from(output.stdout))
 }
 
 /// Structure for NAR file metadata

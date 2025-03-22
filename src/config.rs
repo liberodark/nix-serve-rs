@@ -57,13 +57,17 @@ pub struct Config {
     #[serde(default = "default_false")]
     pub require_auth_uploads: bool,
 
-    /// Whether to compress NARs when serving them (zstd compression)
+    /// Whether to compress NARs when serving them (zstd or xz compression)
     #[serde(default = "default_false")]
     pub compress_nars: bool,
 
-    /// zstd compression level (1-19, higher = better compression but slower)
+    /// Compression level (1-19 for zstd, 0-9 for xz)
     #[serde(default = "default_compression_level")]
     pub compression_level: i32,
+
+    /// Compression format to use (zstd or xz)
+    #[serde(default = "default_compression_format")]
+    pub compression_format: String,
 }
 
 fn default_bind() -> String {
@@ -94,6 +98,10 @@ fn default_compression_level() -> i32 {
     3
 }
 
+fn default_compression_format() -> String {
+    "xz".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -110,6 +118,7 @@ impl Default for Config {
             require_auth_uploads: false,
             compress_nars: false,
             compression_level: default_compression_level(),
+            compression_format: default_compression_format(),
         }
     }
 }
@@ -143,6 +152,10 @@ impl Config {
 
         if let Some(sign_key) = args.sign_key() {
             config.sign_key_paths.push(sign_key);
+        }
+
+        if let Some(compress) = args.compress_nars() {
+            config.compress_nars = compress;
         }
 
         // Validate configuration
@@ -215,6 +228,10 @@ impl Config {
                 config.compression_level = level;
             }
         }
+
+        if let Ok(format) = env::var("NIX_SERVE_COMPRESSION_FORMAT") {
+            config.compression_format = format.to_lowercase();
+        }
     }
 
     fn validate(config: &mut Config) -> Result<()> {
@@ -229,13 +246,40 @@ impl Config {
             bail!("TLS configuration requires both cert and key files");
         }
 
-        // Check zstd compression level
-        if config.compression_level < 1 || config.compression_level > 19 {
+        // Check compression format
+        if !["xz", "zstd"].contains(&config.compression_format.as_str()) {
             warn!(
-                "Invalid compression level {}, using default of 3",
-                config.compression_level
+                "Invalid compression format {}, using default of 'xz'",
+                config.compression_format
             );
-            config.compression_level = 3;
+            config.compression_format = "xz".to_string();
+        }
+
+        // Check compression level
+        match config.compression_format.as_str() {
+            "xz" => {
+                if config.compression_level < 0 || config.compression_level > 9 {
+                    warn!(
+                        "Invalid xz compression level {}, using default of 3",
+                        config.compression_level
+                    );
+                    config.compression_level = 3;
+                }
+            }
+            "zstd" => {
+                if config.compression_level < 1 || config.compression_level > 19 {
+                    warn!(
+                        "Invalid zstd compression level {}, using default of 3",
+                        config.compression_level
+                    );
+                    config.compression_level = 3;
+                }
+            }
+            _ => {
+                // We already validated format above, this should never happen
+                config.compression_format = "xz".to_string();
+                config.compression_level = 3;
+            }
         }
 
         Ok(())
@@ -250,4 +294,5 @@ pub trait ArgsProvider {
     fn bind(&self) -> Option<String>;
     fn workers(&self) -> Option<usize>;
     fn sign_key(&self) -> Option<String>;
+    fn compress_nars(&self) -> Option<bool>;
 }

@@ -83,10 +83,23 @@ async fn query_narinfo(
         }
     };
 
+    // Determine compression and URL path
+    let (compression, url) = if config.compress_nars {
+        (
+            config.compression_format.clone(),
+            format!(
+                "nar/{}-{}.nar.{}",
+                hash, nar_hash, config.compression_format
+            ),
+        )
+    } else {
+        ("none".to_string(), format!("nar/{}-{}.nar", hash, nar_hash))
+    };
+
     let mut narinfo = NarInfo {
         store_path: store_path.to_string(),
-        url: format!("nar/{}.nar?hash={}", nar_hash, hash),
-        compression: "none".to_string(),
+        url,
+        compression,
         nar_hash: format!("sha256:{}", nar_hash),
         nar_size: path_info.nar_size,
         references: Vec::new(),
@@ -215,7 +228,7 @@ pub async fn put(
     let content = std::str::from_utf8(&body)?;
     let lines: Vec<&str> = content.lines().collect();
 
-    // Vérifier minimalement le contenu pour la journalisation
+    // Basic validation of content for logging
     let mut found_store_path = false;
     let mut found_nar_hash = false;
     let mut found_nar_size = false;
@@ -238,18 +251,26 @@ pub async fn put(
             .unwrap());
     }
 
-    // Ensure the narinfo directory exists
-    let real_store_str = config.real_store().to_string();
-    let parent_path = Path::new(&real_store_str)
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine narinfo directory"))?;
+    // Determine where to store the narinfo file
+    let store_root = Path::new(config.real_store());
+    let narinfo_dir = if store_root.is_absolute() {
+        store_root
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cannot determine narinfo directory, real_store has no parent")
+            })?
+            .to_path_buf()
+    } else {
+        store_root.to_path_buf()
+    };
 
-    if !parent_path.exists() {
-        tokio::fs::create_dir_all(parent_path).await?;
+    // Create parent directories if they don't exist
+    if !narinfo_dir.exists() {
+        tokio::fs::create_dir_all(&narinfo_dir).await?;
     }
 
     // Write the narinfo file
-    let narinfo_path = parent_path.join(format!("{}.narinfo", hash));
+    let narinfo_path = narinfo_dir.join(format!("{}.narinfo", hash));
     tokio::fs::write(&narinfo_path, content).await?;
 
     info!("Successfully processed narinfo upload for {}", hash);

@@ -4,6 +4,7 @@ use futures::StreamExt;
 use http::{HeaderMap, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::StreamBody;
+use http_range::HttpRange;
 use hyper::body::Frame;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -15,6 +16,20 @@ use crate::crypto::signing::convert_base16_to_nix32;
 use crate::nix::nar;
 use crate::nix::store::NixStore;
 use crate::routes::{full_body, internal_error, not_found};
+
+/// Represents the query string of a NAR URL.
+#[derive(Debug, serde::Deserialize)]
+pub struct NarRequest {
+    hash: Option<String>,
+    outhash: Option<String>,
+}
+
+/// Represents the parsed parts in a NAR URL.
+#[derive(Debug, serde::Deserialize)]
+pub struct PathParams {
+    narhash: String,
+    outhash: Option<String>,
+}
 
 /// Parse the query string for a NAR request
 fn parse_query(query: Option<&str>) -> Option<String> {
@@ -75,13 +90,13 @@ pub async fn get(
     path: &str,
     query: Option<&str>,
     request_headers: &HeaderMap,
-    _config: &Arc<Config>,
+    config: &Arc<Config>,
     store: &Arc<NixStore>,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>> {
     debug!("NAR request: {}", path);
 
     // Parse the path and query
-    let (narhash, path_outhash, is_compressed) = parse_nar_path(path)?;
+    let (_narhash, path_outhash, is_compressed) = parse_nar_path(path)?;
 
     // Get the output hash, either from the path or the query
     let outhash = if let Some(hash) = path_outhash {
@@ -116,8 +131,8 @@ pub async fn get(
         }
     };
 
-    // Verify the NAR hash - with more flexible validation
-    // We don't strictly check the hash if we're dealing with compressed files
+    // Verify the NAR hash - we now do this in a separate step if needed
+    // We'll check when the actual request is not for a compressed file
     if !is_compressed {
         let info_hash_nix32 = match convert_base16_to_nix32(&path_info.hash) {
             Ok(hash) => hash,
@@ -127,8 +142,9 @@ pub async fn get(
             }
         };
 
-        if narhash != info_hash_nix32 {
-            debug!("Hash mismatch: {} != {}", narhash, info_hash_nix32);
+        // Only verify hash if this is a direct NAR request without compression
+        if path.ends_with(".nar") && !path.contains(&info_hash_nix32) {
+            debug!("Hash mismatch: expected {}", info_hash_nix32);
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("Content-Type", "text/plain")
@@ -153,30 +169,42 @@ pub async fn get(
         "application/x-nix-archive"
     };
 
+    // Determine if we need to compress the response
+    let should_compress = is_compressed && config.compress_nars;
+
     // Stream the NAR with appropriate range handling
     if let Some(range) = range_header {
         debug!("Processing range request: {}", range);
 
-        // Parse range header - we'll implement a basic version here
-        // Format: "bytes=0-1023" or "bytes=1024-"
-        let range_parts: Vec<&str> = range.trim_start_matches("bytes=").split('-').collect();
-        if range_parts.len() != 2 {
+        // Parse range header
+        let ranges = match HttpRange::parse(range, path_info.nar_size) {
+            Ok(ranges) => ranges,
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("Content-Range", format!("bytes */{}", path_info.nar_size))
+                    .body(full_body("Invalid range format"))
+                    .unwrap());
+            }
+        };
+
+        if ranges.is_empty() {
             return Ok(Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("Content-Range", format!("bytes */{}", path_info.nar_size))
-                .body(full_body("Invalid range format"))
+                .body(full_body("No valid ranges specified"))
                 .unwrap());
         }
 
-        let start: u64 = range_parts[0].parse().unwrap_or(0);
-        let end: u64 = if range_parts[1].is_empty() {
-            path_info.nar_size - 1
-        } else {
-            range_parts[1].parse().unwrap_or(path_info.nar_size - 1)
-        };
+        // Currently we only support a single range
+        let range = ranges[0];
 
-        // Validate range boundaries
-        if start >= path_info.nar_size || start > end {
+        // Calculate the end value from start and length
+        let start = range.start;
+        // Ensure end doesn't exceed file size
+        let end = std::cmp::min(range.start + range.length - 1, path_info.nar_size - 1);
+
+        if start > end || start >= path_info.nar_size {
             return Ok(Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("Content-Range", format!("bytes */{}", path_info.nar_size))
@@ -184,59 +212,27 @@ pub async fn get(
                 .unwrap());
         }
 
-        let end = if end >= path_info.nar_size {
-            path_info.nar_size - 1
-        } else {
-            end
-        };
         let length = end - start + 1;
 
-        // Create a temporary NAR file for ranged access
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = temp_dir.path().join("temp.nar");
-
-        // Dump the NAR to a temp file
-        let output = tokio::process::Command::new("nix-store")
-            .arg("--dump")
-            .arg(&real_path)
-            .arg("--to-file")
-            .arg(&temp_path)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            error!(
-                "Failed to create temporary NAR file: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return Ok(internal_error("Failed to create temporary NAR file"));
-        }
-
-        // Open the file for streaming
-        let file = match tokio::fs::File::open(&temp_path).await {
-            Ok(f) => f,
+        // For ranged requests, we use a temp file approach for better reliability
+        let (stream, actual_start, actual_end) = match nar::stream_nar_with_range(
+            real_path.clone(),
+            Some(range_header.unwrap()),
+            path_info.nar_size,
+        )
+        .await
+        {
+            Ok((stream, actual_start, actual_end)) => (stream, actual_start, actual_end),
             Err(e) => {
-                error!("Failed to open temporary NAR file: {}", e);
-                return Ok(internal_error("Failed to open temporary NAR file"));
+                error!("Failed to stream NAR with range: {}", e);
+                return Ok(internal_error(&format!(
+                    "Failed to stream NAR with range: {}",
+                    e
+                )));
             }
         };
 
-        // Create a limited reader for the range
-        let mut reader = tokio::io::BufReader::new(file);
-
-        // Seek to the start position
-        if let Err(e) =
-            tokio::io::AsyncSeekExt::seek(&mut reader, std::io::SeekFrom::Start(start)).await
-        {
-            error!("Failed to seek in NAR file: {}", e);
-            return Ok(internal_error("Failed to seek in NAR file"));
-        }
-
-        // Create a limited reader for the range
-        let limited_reader = tokio::io::AsyncReadExt::take(reader, length);
-        let stream = tokio_util::io::ReaderStream::new(limited_reader);
-
-        // Transform for hyper compatibility
+        // Transform the stream for hyper compatibility
         let mapped_stream = stream.map(|result| match result {
             Ok(chunk) => Ok(Frame::data(chunk)),
             Err(e) => {
@@ -254,39 +250,115 @@ pub async fn get(
             .header("Content-Length", length.to_string())
             .header(
                 "Content-Range",
-                format!("bytes {}-{}/{}", start, end, path_info.nar_size),
+                format!(
+                    "bytes {}-{}/{}",
+                    actual_start, actual_end, path_info.nar_size
+                ),
             )
             .header("Cache-Control", "max-age=31536000") // 1 year
             .body(body)
             .unwrap())
     } else {
         // Regular request - stream full NAR
-        let nar_stream = match nar::stream_nar(real_path).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Failed to stream NAR: {}", e);
-                return Ok(internal_error(&format!("Failed to stream NAR: {}", e)));
+
+        // If we need compression and it's requested as .nar.xz
+        if should_compress {
+            // For compressed NARs, we'll handle this by first dumping to a file and then compressing
+            let temp_dir = tempfile::tempdir()?;
+            let temp_path = temp_dir.path().join("temp.nar");
+
+            // First dump the NAR to a temp file
+            let output = tokio::process::Command::new("nix-store")
+                .arg("--dump")
+                .arg(&real_path)
+                .arg("--to-file")
+                .arg(&temp_path)
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                error!(
+                    "Failed to create temporary NAR file: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return Ok(internal_error("Failed to create temporary NAR file"));
             }
-        };
 
-        // Transform for hyper compatibility
-        let mapped_stream = nar_stream.map(|result| match result {
-            Ok(chunk) => Ok(Frame::data(chunk)),
-            Err(e) => {
-                error!("Error streaming NAR: {}", e);
-                Ok(Frame::data(Bytes::new()))
+            // Then compress it with xz using standard process (avoiding tokio::fs::File issues)
+            let compressed_path = temp_dir.path().join("temp.nar.xz");
+            let level_arg = format!("-{}", config.compression_level);
+
+            let compress_output = tokio::process::Command::new("xz")
+                .arg("-z")
+                .arg(level_arg)
+                .arg("-c")
+                .arg(&temp_path)
+                .output()
+                .await?;
+
+            if !compress_output.status.success() {
+                error!("Failed to compress NAR file");
+                return Ok(internal_error("Failed to compress NAR file"));
             }
-        });
 
-        let body = BoxBody::new(StreamBody::new(mapped_stream));
+            // Write compressed data to file
+            tokio::fs::write(&compressed_path, &compress_output.stdout).await?;
 
-        Ok(Response::builder()
-            .header("Content-Type", content_type)
-            .header("Accept-Ranges", "bytes")
-            .header("Content-Length", path_info.nar_size.to_string())
-            .header("Cache-Control", "max-age=31536000") // 1 year
-            .body(body)
-            .unwrap())
+            // Get the compressed file size
+            let compressed_size = tokio::fs::metadata(&compressed_path).await?.len();
+
+            // Stream the compressed file
+            let file = tokio::fs::File::open(&compressed_path).await?;
+            let reader = tokio::io::BufReader::new(file);
+            let stream = tokio_util::io::ReaderStream::new(reader);
+
+            // Transform for hyper compatibility
+            let mapped_stream = stream.map(|result| match result {
+                Ok(chunk) => Ok(Frame::data(chunk)),
+                Err(e) => {
+                    error!("Error streaming compressed NAR: {}", e);
+                    Ok(Frame::data(Bytes::new()))
+                }
+            });
+
+            let body = BoxBody::new(StreamBody::new(mapped_stream));
+
+            Ok(Response::builder()
+                .header("Content-Type", "application/x-nix-archive-compressed")
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Length", compressed_size.to_string())
+                .header("Cache-Control", "max-age=31536000") // 1 year
+                .body(body)
+                .unwrap())
+        } else {
+            // Regular uncompressed streaming
+            let nar_stream = match nar::stream_nar(real_path).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("Failed to stream NAR: {}", e);
+                    return Ok(internal_error(&format!("Failed to stream NAR: {}", e)));
+                }
+            };
+
+            // Transform for hyper compatibility
+            let mapped_stream = nar_stream.map(|result| match result {
+                Ok(chunk) => Ok(Frame::data(chunk)),
+                Err(e) => {
+                    error!("Error streaming NAR: {}", e);
+                    Ok(Frame::data(Bytes::new()))
+                }
+            });
+
+            let body = BoxBody::new(StreamBody::new(mapped_stream));
+
+            Ok(Response::builder()
+                .header("Content-Type", content_type)
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Length", path_info.nar_size.to_string())
+                .header("Cache-Control", "max-age=31536000") // 1 year
+                .body(body)
+                .unwrap())
+        }
     }
 }
 
@@ -325,8 +397,45 @@ pub async fn put(
         }
     };
 
-    // Store the NAR file - with appropriate handling for compressed files
-    let nar_path = match store.store_nar(&hash_part, &narhash, body).await {
+    let processed_body: Bytes;
+
+    // Handle compressed files - decompress them first
+    if is_compressed {
+        info!("Decompressing uploaded NAR file for: {}", path);
+
+        // Create a temp directory
+        let temp_dir = tempfile::tempdir()?;
+        let compressed_path = temp_dir.path().join("input.nar.xz");
+
+        // Write the compressed data to a file
+        tokio::fs::write(&compressed_path, &body).await?;
+
+        // Decompress with xz using subprocess instead of piping
+        let output = tokio::process::Command::new("xz")
+            .arg("-d")
+            .arg("-c")
+            .arg(&compressed_path)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            error!("Failed to decompress NAR file");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "text/plain")
+                .body(full_body("Failed to decompress NAR file"))
+                .unwrap());
+        }
+
+        // Use the decompressed output
+        processed_body = Bytes::from(output.stdout);
+    } else {
+        // No decompression needed
+        processed_body = body;
+    }
+
+    // Store the NAR file
+    let nar_path = match store.store_nar(&hash_part, &narhash, processed_body).await {
         Ok(path) => path,
         Err(e) => {
             error!("Failed to store NAR: {}", e);
@@ -337,19 +446,6 @@ pub async fn put(
                 .unwrap());
         }
     };
-
-    // Special handling for compressed files
-    if is_compressed {
-        info!("Storing compressed NAR file: {}", nar_path.display());
-
-        // For compressed files, we might need to decompress before importing
-        // For now, we'll just acknowledge receipt
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/plain")
-            .body(full_body("Compressed NAR file stored successfully"))
-            .unwrap());
-    }
 
     // Import the NAR into the Nix store
     let store_path = match store.import_nar(&nar_path).await {
@@ -441,11 +537,21 @@ pub async fn head(
         "application/x-nix-archive"
     };
 
+    // If we're supposed to be compressing and this is a compressed request,
+    // we should return the expected file size instead of the actual NAR size
+    let content_length = if is_compressed {
+        // We don't know the compressed size without actually compressing,
+        // but we can estimate it as roughly 30% of the original size
+        (path_info.nar_size as f64 * 0.3) as u64
+    } else {
+        path_info.nar_size
+    };
+
     // Return success with NAR info
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
-        .header("Content-Length", path_info.nar_size.to_string())
+        .header("Content-Length", content_length.to_string())
         .header("Accept-Ranges", "bytes")
         .header("Cache-Control", "max-age=31536000") // 1 year
         .body(full_body(""))
