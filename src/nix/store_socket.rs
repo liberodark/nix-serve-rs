@@ -47,7 +47,7 @@ impl PathInfoCache {
 pub struct NixStore {
     virtual_store: String,
     real_store: String,
-    daemon: Mutex<NixDaemonProtocol>,
+    pub daemon: Mutex<NixDaemonProtocol>,
     cache: Mutex<PathInfoCache>,
     config: Config,
 }
@@ -212,6 +212,7 @@ impl NixStore {
         {
             let cache = self.cache.lock().await;
             if let Some(info) = cache.get(path) {
+                debug!("Path info found in cache for: {}", path);
                 return Ok(Some(info.clone()));
             }
         }
@@ -219,6 +220,7 @@ impl NixStore {
         // Not in cache, query from daemon
         let result = match self.daemon.lock().await.query_path_info(path).await {
             Ok(daemon_info) => {
+                debug!("Got path info from daemon for: {}", path);
                 // Convert daemon PathInfo to our PathInfo
                 let info = convert_path_info(daemon_info);
 
@@ -242,6 +244,7 @@ impl NixStore {
                 // Fallback to command-line approach
                 match self.query_path_info_fallback(path).await {
                     Ok(Some(info)) => {
+                        debug!("Got path info via fallback for: {}", path);
                         // Cache the result
                         {
                             let mut cache = self.cache.lock().await;
@@ -279,26 +282,29 @@ impl NixStore {
         }
 
         let raw_hash = String::from_utf8(hash_output.stdout)?.trim().to_string();
+        debug!("Raw hash from nix-store command: {}", raw_hash);
 
         // Convert the hash to base32 if it's in hex format and add sha256: prefix
-        let hash = if raw_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        let hash = if raw_hash.starts_with("sha256:") {
+            raw_hash
+        } else if raw_hash.chars().all(|c| c.is_ascii_hexdigit()) {
             // Try to convert from hex to base32
+            debug!("Converting hash from hex: {}", raw_hash);
             match convert_base16_to_nix32(&raw_hash) {
-                Ok(base32) => format!("sha256:{}", base32),
+                Ok(base32) => {
+                    debug!("Converted to base32: {}", base32);
+                    format!("sha256:{}", base32)
+                }
                 Err(e) => {
                     debug!("Failed to convert hash to base32: {}", e);
-                    if raw_hash.starts_with("sha256:") {
-                        raw_hash
-                    } else {
-                        format!("sha256:{}", raw_hash)
-                    }
+                    format!("sha256:{}", raw_hash)
                 }
             }
-        } else if raw_hash.starts_with("sha256:") {
-            raw_hash
         } else {
             format!("sha256:{}", raw_hash)
         };
+
+        debug!("Final hash format: {}", hash);
 
         // Get NAR size
         let size_output = tokio::process::Command::new("nix-store")
@@ -366,6 +372,8 @@ impl NixStore {
             sigs: Vec::new(),      // Not easily available from command line
             content_address: None, // Not easily available from command line
         };
+
+        debug!("Created PathInfo with hash: {}", info.hash);
 
         Ok(Some(info))
     }
@@ -502,6 +510,8 @@ impl NixStore {
                 NixServeError::internal(format!("Invalid store path format: {}", store_path))
             })?;
 
+        debug!("Extracted hash part: {}", hash_part);
+
         // Query path info using the daemon socket
         let path_info = match self.daemon.lock().await.query_path_info(store_path).await {
             Ok(daemon_info) => {
@@ -510,10 +520,17 @@ impl NixStore {
             }
             Err(e) => {
                 debug!("Failed to query path info via daemon: {}", e);
-                return Err(NixServeError::nix_daemon(format!(
-                    "Failed to query path info: {}",
-                    e
-                )));
+
+                // Try fallback method
+                match self.query_path_info_fallback(store_path).await {
+                    Ok(Some(info)) => info,
+                    _ => {
+                        return Err(NixServeError::nix_daemon(format!(
+                            "Failed to query path info: {}",
+                            e
+                        )))
+                    }
+                }
             }
         };
 
@@ -566,9 +583,12 @@ impl NixStore {
 
         // Create URL based on compression settings
         let url = if self.config.compress_nars {
-            format!("nar/{}.nar.{}", hash_part, self.config.compression_format)
+            format!(
+                "nar/{}.nar.{}?hash={}",
+                hash_base32, self.config.compression_format, hash_part
+            )
         } else {
-            format!("nar/{}.nar", hash_part)
+            format!("nar/{}.nar?hash={}", hash_base32, hash_part)
         };
 
         // Get reference basenames
@@ -584,12 +604,13 @@ impl NixStore {
             .join(" ");
 
         // Create narinfo content
-        let narinfo_content =
-            format!(
-            "StorePath: {}\nURL: {}\nCompression: {}\nNarHash: {}\nNarSize: {}\nReferences: {}\n",
+        let narinfo_content = format!(
+            "StorePath: {}\nURL: {}\nCompression: {}\nFileHash: {}\nFileSize: {}\nNarHash: {}\nNarSize: {}\nReferences: {}\n",
             store_path,
             url,
             if self.config.compress_nars { &self.config.compression_format } else { "none" },
+            nar_hash,
+            path_info.nar_size,
             nar_hash,
             path_info.nar_size,
             ref_basenames

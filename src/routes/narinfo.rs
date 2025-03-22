@@ -39,6 +39,8 @@ fn format_narinfo_txt(narinfo: &NarInfo) -> String {
         format!("StorePath: {}", narinfo.store_path),
         format!("URL: {}", narinfo.url),
         format!("Compression: {}", narinfo.compression),
+        format!("FileHash: {}", narinfo.nar_hash),
+        format!("FileSize: {}", narinfo.nar_size),
         format!("NarHash: {}", narinfo.nar_hash),
         format!("NarSize: {}", narinfo.nar_size),
     ];
@@ -75,7 +77,19 @@ async fn query_narinfo(
         None => return Ok(None),
     };
 
-    let nar_hash = match convert_base16_to_nix32(&path_info.hash) {
+    debug!("Raw hash from daemon: {}", path_info.hash);
+
+    // Convert the hash to base32
+    // Strip 'sha256:' prefix if present
+    let hash_hex = if path_info.hash.starts_with("sha256:") {
+        path_info.hash[7..].to_string()
+    } else {
+        path_info.hash.clone()
+    };
+
+    debug!("Hash after prefix handling: {}", hash_hex);
+
+    let nar_hash = match convert_base16_to_nix32(&hash_hex) {
         Ok(hash) => hash,
         Err(e) => {
             error!("Failed to convert hash: {}", e);
@@ -83,17 +97,22 @@ async fn query_narinfo(
         }
     };
 
+    debug!("Final base32 encoded hash: {}", nar_hash);
+
     // Determine compression and URL path
     let (compression, url) = if config.compress_nars {
         (
             config.compression_format.clone(),
             format!(
-                "nar/{}-{}.nar.{}",
-                hash, nar_hash, config.compression_format
+                "nar/{}.nar.{}?hash={}",
+                nar_hash, config.compression_format, hash
             ),
         )
     } else {
-        ("none".to_string(), format!("nar/{}-{}.nar", hash, nar_hash))
+        (
+            "none".to_string(),
+            format!("nar/{}.nar?hash={}", nar_hash, hash),
+        )
     };
 
     let mut narinfo = NarInfo {
@@ -141,6 +160,9 @@ async fn query_narinfo(
     } else if !path_info.sigs.is_empty() {
         narinfo.sigs = path_info.sigs;
     }
+
+    let narinfo_content = format_narinfo_txt(&narinfo);
+    debug!("Generated narinfo content:\n{}", narinfo_content);
 
     Ok(Some(narinfo))
 }
